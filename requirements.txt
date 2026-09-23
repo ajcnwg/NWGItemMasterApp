@@ -1,0 +1,9 @@
+streamlit
+pandas
+sqlalchemy
+pyodbc
+python-dotenv
+streamlit-authenticator
+pyyaml
+openpyxl
+pyxlsb

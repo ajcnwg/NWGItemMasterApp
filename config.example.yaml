@@ -1,0 +1,24 @@
+credentials:
+  usernames:
+    admin:
+      name: Admin
+      email: admin@example.com
+      # Generate with: python hash_password.py
+      password: PASTE_BCRYPT_HASH_HERE
+      role: admin
+    reviewer:
+      name: Reviewer
+      email: reviewer@example.com
+      password: PASTE_BCRYPT_HASH_HERE
+      role: editor
+    viewer:
+      name: Viewer
+      email: viewer@example.com
+      password: PASTE_BCRYPT_HASH_HERE
+      role: viewer
+
+cookie:
+  name: nwg_item_master_app_auth
+  # Generate a real random value for this, e.g.: python -c "import secrets; print(secrets.token_hex(32))"
+  key: change_this_signing_key_to_something_random
+  expiry_days: 1
