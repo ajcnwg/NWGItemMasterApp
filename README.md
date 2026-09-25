@@ -93,16 +93,29 @@ distributor's new file comes in:
    - **`duplicate_upc`** — the same UPC appeared more than once in that file.
    - **`excluded_value`** — dropped by that source's own Exclude
      Column/Values rule (e.g. KEHE's `UOM` = `DS`/`PL`).
-3. **Run Merge.** This rebuilds `dbo.items` from scratch out of
-   `raw_items` — but manual work survives it:
-   - **Manual edits** (Item Master inline edits) and **manually-added
-     items** (Add Item) are saved to `dbo.manual_overrides` and re-applied
-     on top of every merge, field by field.
-   - **Manual deletions** are remembered in `dbo.deleted_upcs` (with a full
-     snapshot of the item's data) so a source that still lists a deleted UPC
-     doesn't silently bring it back. The Delete Item tab has a "Deleted
-     items" list (searchable) with a **Restore Item** button that brings
-     the item back with its original data intact.
+3. **Compute and push the Merge.** A Merge only **adds new UPCs**. Files
+   are read in full, but an item already in the item master is never
+   changed by them — not its description, brand, category, pack/size, nor
+   its Department Review group — and it's kept even if no file lists it any
+   more. New UPCs are built from the highest-priority source that has them,
+   cleaned by that source's rules, and after the push every Department
+   Review decision applies to them (new items in a decided group inherit its
+   Department). Only the new rows are written, so a quiet month costs
+   almost nothing. Manual work still applies:
+   - **Manual edits** (Item Master inline edits, UPC Overrides) and
+     **manually-added items** (Add Item) live in `dbo.manual_overrides`.
+     An edit pins only the fields it actually changed.
+   - **Manual deletions** are remembered in `dbo.deleted_upcs`, so a file
+     that still lists a deleted UPC never brings it back. The Delete Item
+     tab's "Deleted items" list has a **Restore Item** button.
+   The Merge tab shows, before you push, **every new item in the draft**
+   with its row data and the decision it will get (the decided group it
+   falls into, a group waiting in Crosswalk/Unmatched, or a new group), and
+   afterwards **Items added by past Merges** — each one's Department, the
+   decision behind it, and a jump straight to any group still waiting.
+   **Check the item master against every rule and decision** re-checks all
+   items and *stages* a fix — every item, field, current and new value, and
+   the rule or decision behind it — applied only on request, and undoable.
 4. **Spot-check.** The Merge tab has a "Spot-check against a reference UPC
    list" tool — upload any known-good UPC list (a prior export, etc.) and
    it reports match %, flagging anything under 50% as a likely cleaning bug.
@@ -111,7 +124,7 @@ distributor's new file comes in:
 
 ## Department Review — the crosswalk/decision workflow
 
-This is the largest part of the app (`dept_mapping.py`) and the piece
+This is the largest part of the app (`itemmaster/dept_mapping.py`) and the piece
 script.py's original "Workbooks To Edit" Department decision sheets are
 replaced by. When a merge pulls in a source/department/category/
 subcategory combination that isn't NWG's own trusted data, it doesn't get
@@ -126,9 +139,16 @@ engine's own auto-matching) to decide first. Sub-tabs, left to right:
   department by hand or break it out.
 - **Broken Out** — per-UPC decisions inside a combo that's a real mix
   (e.g. a KEHE category spanning both Health/Body Care and Grocery).
-  Editable **Excel-like grid** (`st.data_editor` with a department
-  dropdown column) so you can select, paste, or drag-fill department
-  values across many rows at once, the way you would in a spreadsheet.
+  Claim a group, then fill its items in a **spreadsheet-style grid** —
+  one for the undecided items and one for the auto-decided ones (which
+  are just as likely to need changing). Every row starts blank. Pick from
+  a cell's dropdown, drag a filled cell's corner handle to copy it down,
+  Ctrl+D, or paste a column of Departments from Excel. Nothing reloads
+  while you work. Filter the rows (e.g. `cola, pepsi`), then **Set all
+  shown** / **Set ✓ rows** / **Clear ✓ rows** in a click, or **Fill blanks
+  with suggestions** (auto departments, on the auto grid). Each group can
+  also be downloaded to Excel and uploaded back. The same grid is used on
+  Pending Changes and Decided.
   Whoever decides a UPC first **owns** it; anyone else who disagrees
   submits a suggestion the owner (or admin) explicitly accepts or denies —
   never a silent majority vote.
@@ -142,20 +162,92 @@ engine's own auto-matching) to decide first. Sub-tabs, left to right:
   Undo authority: the original stager of a combo, or the first person to
   ever decide a UPC in a Broken Out group, can undo it alone; anyone else's
   click just files a request that shows up under Undo requested for the
-  authorized person (or an admin) to action.
+  authorized person (or an admin) to action. Pushing needs two editors'
+  approvals (or one admin) and updates Department in the live item master
+  immediately — no separate Merge needed.
 - **Decided** — everything already pushed to `dbo.items` through this
   workflow, with a plain-language note on how it was decided, and one
   click to send it back to Crosswalk/Unmatched/Broken Out if a decision
   turns out to be wrong.
-- **Settings** — the reference tables the engine reads: canonical
-  Department list, Unmatched Defaults, Strict Departments, and matching
-  thresholds (minimum purity/sample size, chaining rounds, etc.).
+- **Settings** (admins edit, editors can look) — the reference tables the
+  engine reads: canonical Department list, Unmatched Defaults, Strict
+  Departments, and matching thresholds. Saving re-runs the engine right
+  away (about a minute) and updates the item master. A group that was only
+  ever auto-decided goes back to Crosswalk/Unmatched when its Department is
+  marked Strict, and returns to its auto decision if that's undone; groups
+  a person decided are never touched.
+
+**Undo / Redo** (top bar): one universal Undo — takes back, or puts back,
+your newest step, whether it's grid work you haven't staged yet (a Set
+all, a paste, a fill) or a saved Department Review action: a vote, "I also agree", a
+grid Apply, Accept/Deny, an admin override, a Break Out / Send Back, the
+group Undo… popup itself. It refuses (and says so) if someone else has
+changed that group since, and never touches anything already pushed live —
+Snapshots cover those.
+
+**Notifications** (bell, sidebar): what's waiting on you and what changed
+on your work since your last visit, with search and a type filter; each
+card's View button opens the group. Admins also get a Team view, one
+person at a time.
 
 **Admin override**: an admin can force any combo or Broken Out group to a
 specific department at any time. Once set, it's locked — no one else's
 Approve/Suggest/Agree does anything until an admin either changes the
 override or explicitly removes it (which reopens it to normal review
 rather than silently keeping the last value).
+
+## Adding, deleting or changing many items at once
+
+Add Item, Delete Item and UPC Overrides each have an **upload a
+spreadsheet** section: download the blank template, fill it in (or paste
+into it), upload it, check the preview — every row says Ready, No change,
+or exactly what's wrong — and stage everything in one click. For UPC
+Overrides, fill in only the columns you want to change; a blank cell keeps
+the current value. Everything staged goes to Pending Changes like a single
+edit.
+
+## Snapshots
+
+A snapshot saves the item master, every Department Review decision and
+staged change, Settings, and each source's settings (not the raw
+distributor files — too big). Each one records a short summary — items per
+source, groups per state, what was staged and by whom, the latest file per
+source — shown in one line on the Snapshots tab, with the full breakdown
+and a **Compare with what's live now** button under **Details**.
+
+| Kind | Taken | Kept |
+|---|---|---|
+| Manual | Take Snapshot Now | until someone deletes it |
+| Monthly | refreshed after every Merge push | last 12 months |
+| Automatic | before every Merge push / restore | newest 15 |
+
+Restoring takes an automatic copy of the current state first, removes any
+source added after the snapshot (with its data), and clears everyone's
+top-bar Undo history. **Undo this restore** at the top of the tab puts
+the pre-restore data back (and can itself be undone).
+
+## Monthly refresh (in the app or on a schedule)
+
+Upload & Ingest → **Monthly refresh** takes every distributor file at
+once: each is matched to its source by the source's **File Keyword**, read
+with that source's cleaning rules, and compared with its last upload (a
+file under half its usual size is held back until someone confirms it).
+One Merge draft is then computed — every Department Review decision is
+applied to the new data, new items in decided groups inherit their
+Department, and genuinely new groups land in Crosswalk/Unmatched.
+
+Once hosted, the same thing can run unattended from an inbox folder:
+
+```
+python scripts/monthly_refresh.py --inbox "D:/ItemMaster/inbox" --check-only   # report only
+python scripts/monthly_refresh.py --inbox "D:/ItemMaster/inbox"                # ingest + compute draft
+python scripts/monthly_refresh.py --inbox "D:/ItemMaster/inbox" --push         # ...and push it live
+```
+
+Processed files move to `inbox/processed/<date>/`, held-back ones to
+`inbox/held/<date>/`, with a log file beside them. `--push` never pushes if
+a file was held back. Without it the draft waits on the Merge tab for an
+admin.
 
 ## What was deliberately left out of this version
 
@@ -166,6 +258,29 @@ rather than silently keeping the last value).
   for a UPC split across two raw columns; `strip_leading_code_fields` for a
   leading numeric code) — script.py's more general "Combine Two Columns"
   rule (e.g. UNFI Natural's Segment/Sub-Segment) isn't ported.
+
+## What's where
+
+```
+ItemMasterApp/
+├── app.py                    the app itself — run this with Streamlit
+├── itemmaster/               the app's code
+│   ├── db.py                 database connection (waits out a waking database)
+│   ├── dept_mapping.py       Department Review engine, staging, undo, snapshots, merge
+│   ├── ingest.py             reading and cleaning distributor files
+│   ├── autodetect.py         guessing which column is which in a new file
+│   ├── item_bulk.py          bulk add / delete / change uploads
+│   ├── monthly_refresh.py    the monthly refresh (in the app and the script)
+│   └── old_workbook_import.py  admin import of an old department workbook
+├── migrations/
+│   └── 001_create_schema.py  the complete database schema, in one file
+├── scripts/                  command-line tools (monthly refresh, passwords, reset, seeding)
+├── Inputs/                   the distributor source files
+├── .streamlit/config.toml    hides Streamlit's developer toolbar and error details
+├── config.example.yaml       login accounts template (copy to config.yaml)
+├── .env.example              database connection template (copy to .env)
+└── requirements.txt
+```
 
 ## Setup
 
@@ -194,9 +309,13 @@ rather than silently keeping the last value).
    ```bash
    python migrations/001_create_schema.py
    ```
-   This builds every table the app needs in one pass. If a future change
-   needs a schema update, it'll ship as a new `migrations/002_*.py` and so
-   on — run any new ones the same way, in order.
+   This one file builds the whole database — every table, index, foreign
+   key and seed row — and was checked against the live database (rebuilt in
+   a throwaway schema and compared column by column: identical). The
+   earlier step-by-step migrations are folded into it. If a future change
+   needs a schema update, add a `migrations/002_*.py`, and fold it back into
+   001 the same way once it's run. `scripts/reset_schema.py` wipes a
+   database and rebuilds it from 001 (destructive — scratch databases only).
 
 4. **Run the app:**
    ```bash
@@ -250,7 +369,7 @@ On the **Sources** tab, under "Add a new source", you can optionally upload
 a sample file first and click **Analyze File and Fill In Form** — it
 detects the real header row (skipping title banners, matching e.g. NWG's
 row-2 header) and guesses which column is UPC/Department/Category/
-Subcategory/Brand/Description by keyword, in `autodetect.py`
+Subcategory/Brand/Description by keyword, in `itemmaster/autodetect.py`
 (`detect_header_row`, `guess_column_mapping`). This is generic across any
 distributor's naming, not hardcoded to any one source — tested against all
 six real files, it filled in every field correctly for SPINS/KEHE/URM/NWG,

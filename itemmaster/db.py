@@ -9,6 +9,7 @@ driver is actually installed on this machine, preferring the newest.
 import os
 import time
 import urllib.parse
+from pathlib import Path
 from contextlib import contextmanager
 
 import pyodbc
@@ -16,18 +17,33 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 
-load_dotenv()
+# .env lives in the app folder, one level up from this package.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # SQLSTATEs/phrases typical of a connection-level timeout — most commonly an
 # Azure SQL serverless database that auto-paused after being idle and hasn't
 # finished waking up yet, not a real query/logic error. Safe to retry: this
 # always fails before any statement runs, so nothing has partially executed.
-TRANSIENT_MARKERS = ("08001", "08S01", "HYT00", "HYT01", "Login timeout expired", "TCP Provider")
+TRANSIENT_MARKERS = ("08001", "08S01", "HYT00", "HYT01", "Login timeout expired", "TCP Provider",
+                     # Azure SQL: database resuming / briefly unavailable / busy.
+                     "40613", "40197", "40501", "49918", "is not currently available")
+
+# Azure SQL refused this network address (firewall) — waiting won't fix it.
+FIREWALL_MARKER = "40615"
+
+
+# How long a new connection keeps retrying a waking database before giving
+# up (on top of each attempt's own 30 s login timeout).
+WAKE_WAIT_SECONDS = 180
+
+# Optional callback(attempt, delay, exc) run before each wait — the app sets
+# this to show a "database is waking up" message.
+on_wake_wait = None
 
 
 def is_transient_connection_error(exc: Exception) -> bool:
     message = str(exc)
-    return any(marker in message for marker in TRANSIENT_MARKERS)
+    return FIREWALL_MARKER not in message and any(marker in message for marker in TRANSIENT_MARKERS)
 
 PREFERRED_DRIVERS = [
     "ODBC Driver 18 for SQL Server",
@@ -65,7 +81,30 @@ def get_engine():
         "Connection Timeout=30;"
     )
     params = urllib.parse.quote_plus(odbc_str)
-    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}", fast_executemany=True)
+
+    def connect_waiting():
+        # Every new connection — from anywhere in the app — waits for a
+        # paused Azure SQL database to wake up (usually under a minute)
+        # instead of failing on the first login timeout.
+        waited, attempt = 0.0, 0
+        while True:
+            try:
+                return pyodbc.connect(odbc_str)
+            except pyodbc.Error as e:
+                if not is_transient_connection_error(e) or waited >= WAKE_WAIT_SECONDS:
+                    raise
+                delay = min(5.0 * (attempt + 1), 15.0)
+                if on_wake_wait:
+                    try:
+                        on_wake_wait(attempt, delay, e)
+                    except Exception:
+                        pass
+                time.sleep(delay)
+                waited += delay
+                attempt += 1
+
+    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}", fast_executemany=True,
+                         creator=connect_waiting, pool_pre_ping=True)
 
 
 def _retry_delays(attempts: int, base_delay: float) -> list:

@@ -13,7 +13,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from db import get_engine
+from itemmaster.db import get_engine
 
 SOURCES = [
     {

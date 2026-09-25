@@ -16,8 +16,8 @@ import pandas as pd
 from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from db import get_engine
-from ingest import map_and_clean, read_raw_file, stage_source
+from itemmaster.db import get_engine
+from itemmaster.ingest import map_and_clean, read_raw_file, stage_source
 
 INPUTS = str(Path(__file__).resolve().parent.parent / "Inputs")
 

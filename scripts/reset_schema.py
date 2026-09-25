@@ -15,7 +15,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from db import get_engine
+from itemmaster.db import get_engine
 
 _spec = importlib.util.spec_from_file_location(
     "create_schema", Path(__file__).resolve().parent.parent / "migrations" / "001_create_schema.py"

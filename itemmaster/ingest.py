@@ -410,7 +410,7 @@ def stage_source(engine, source_key: str, cleaned_df: pd.DataFrame, rejected_df:
     any month's file didn't make it in. Returns the new ingestion_log id.
     Retries a transient connection timeout (e.g. Azure SQL serverless
     waking up from idle) via robust_begin — see db.py."""
-    from db import robust_begin
+    from itemmaster.db import robust_begin
 
     with robust_begin(engine, on_retry=on_retry) as conn:
         conn.execute(text("DELETE FROM dbo.raw_items WHERE source_key = :sk"), {"sk": source_key})

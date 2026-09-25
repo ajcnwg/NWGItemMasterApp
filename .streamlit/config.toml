@@ -1,0 +1,9 @@
+[client]
+# Only the app's own menu in the top-right: no Deploy button, no developer tools.
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[runner]
+# The app never uses "magic" (bare expressions auto-displayed); turning it off
+# saves Streamlit re-parsing all of app.py on every run.
+magicEnabled = false

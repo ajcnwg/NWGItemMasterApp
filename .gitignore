@@ -1,11 +1,34 @@
+# Secrets — database connection and login accounts (copy the *.example files)
 .env
+.env.*
+!.env.example
 config.yaml
+.streamlit/secrets.toml
+
+# Company data — distributor source files, uploads, exports and logs
+Inputs/*
+!Inputs/README.md
+uploads/
+*.xlsx
+*.xls
+*.xlsb
+*.xlsm
+*.csv
+*.pkl
+*.parquet
+*.log
+~$*
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
-.streamlit/secrets.toml
-uploads/
+
+# Editors / OS / local tools
 .claude
-Inputs/*.xlsx
-*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
