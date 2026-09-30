@@ -928,12 +928,6 @@ def get_prepared_engine_data(engine) -> dict:
     return data
 
 
-def prepared_engine_data_is_warm(engine) -> bool:
-    with _PREPARED_LOCK:
-        cached = _PREPARED["token"]
-    return cached is not None and cached == _engine_data_token(engine)
-
-
 def run_engine(engine, config_overrides: dict = None) -> dict:
     """Runs the full engine against live data and writes the incremental
     delta back to dbo.dept_mapping_combos / dept_mapping_combo_upcs.
@@ -1610,11 +1604,12 @@ def apply_upc_decisions(engine, decisions: dict, pushed_by: str) -> None:
             text(
                 "UPDATE dbo.dept_mapping_upc_overrides SET department = :department, "
                 "decided_via = 'Manually Reviewed', updated_by = :staged_by, updated_at = SYSUTCDATETIME(), "
-                "pushed_by = :pushed_by, pushed_at = SYSUTCDATETIME() "
+                "pushed_by = :pushed_by, pushed_at = SYSUTCDATETIME(), decided_note = :note "
                 "WHERE upc = :upc"
             ),
             [
-                {"upc": u, "department": d["department"], "staged_by": d.get("staged_by") or pushed_by, "pushed_by": pushed_by}
+                {"upc": u, "department": d["department"], "staged_by": d.get("staged_by") or pushed_by, "pushed_by": pushed_by,
+                 "note": d.get("origin_note")}
                 for u, d in decisions.items()
             ],
         )
@@ -1663,7 +1658,7 @@ def get_decided_combos(engine) -> pd.DataFrame:
             text(
                 "SELECT combo_id, source_key, raw_department, raw_category, raw_subcategory, "
                 "n_upcs_total, decided_department, decided_via, approved, decision_state, tier, n_evidence, "
-                "last_decided_by, last_decided_at, pushed_by, pushed_at "
+                "last_decided_by, last_decided_at, pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_combos "
                 "WHERE decided_department IS NOT NULL AND decision_state IN ('not_reviewed', 'decided')"
             ),
@@ -1673,7 +1668,7 @@ def get_decided_combos(engine) -> pd.DataFrame:
             text(
                 "SELECT combo_id, source_key, raw_department, raw_category, raw_subcategory, "
                 "n_upcs_total, decided_department, decided_via, approved, decision_state, tier, n_evidence, "
-                "last_decided_by, last_decided_at, pushed_by, pushed_at "
+                "last_decided_by, last_decided_at, pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_combos WHERE decision_state = 'decided_broken_out'"
             ),
             conn,
@@ -1745,14 +1740,14 @@ def _combo_snapshot(conn, combo_id: int) -> dict:
     combo_row = conn.execute(
         text(
             "SELECT decision_state, decided_department, decided_via, approved, rejected, manual_department, "
-            "last_decided_by, last_decided_at FROM dbo.dept_mapping_combos WHERE combo_id = :combo_id"
+            "last_decided_by, last_decided_at, decided_note FROM dbo.dept_mapping_combos WHERE combo_id = :combo_id"
         ),
         {"combo_id": combo_id},
     ).mappings().first()
     override_rows = conn.execute(
         text(
             "SELECT upc, department, decided_via, suggested_department, suggested_via, "
-            "updated_by, updated_at, pushed_by, pushed_at "
+            "updated_by, updated_at, pushed_by, pushed_at, decided_note "
             "FROM dbo.dept_mapping_upc_overrides WHERE combo_id = :combo_id"
         ),
         {"combo_id": combo_id},
@@ -1814,7 +1809,7 @@ def _restore_combo_snapshot(conn, combo_id: int, snapshot: dict, actor: str) -> 
             UPDATE dbo.dept_mapping_combos
             SET decision_state = :decision_state, decided_department = :decided_department,
                 decided_via = :decided_via, approved = :approved, rejected = :rejected,
-                manual_department = :manual_department,
+                manual_department = :manual_department, decided_note = :decided_note,
                 last_decided_at = :last_decided_at, last_decided_by = :last_decided_by
             WHERE combo_id = :combo_id
             """
@@ -1825,14 +1820,14 @@ def _restore_combo_snapshot(conn, combo_id: int, snapshot: dict, actor: str) -> 
         # to the person undoing.)
         {
             "last_decided_by": actor, "last_decided_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" "),
-            **combo, "combo_id": combo_id,
+            "decided_note": None, **combo, "combo_id": combo_id,
         },
     )
     conn.execute(text("DELETE FROM dbo.dept_mapping_upc_overrides WHERE combo_id = :combo_id"), {"combo_id": combo_id})
     overrides = snapshot.get("overrides") or []
     if overrides:
         cols = ["upc", "department", "decided_via", "suggested_department", "suggested_via",
-                "updated_by", "updated_at", "pushed_by", "pushed_at"]
+                "updated_by", "updated_at", "pushed_by", "pushed_at", "decided_note"]
         conn.execute(
             text(
                 f"INSERT INTO dbo.dept_mapping_upc_overrides (combo_id, {', '.join(cols)}) "
@@ -1846,6 +1841,24 @@ def _restore_combo_snapshot(conn, combo_id: int, snapshot: dict, actor: str) -> 
     _restore_staged(conn, combo_id, snapshot)
 
 
+def _reset_to_review(conn, combo_id: int, actor: str) -> None:
+    """Back to "no decision": the group returns to the queue its tier says
+    (an auto-tier one is flagged rejected so the engine leaves it for a person)."""
+    conn.execute(
+        text(
+            """
+            UPDATE dbo.dept_mapping_combos
+            SET manual_department = NULL, decision_state = 'not_reviewed',
+                decided_department = NULL, decided_via = NULL, approved = 0, decided_note = NULL,
+                rejected = CASE WHEN tier = 'auto' THEN 1 ELSE 0 END,
+                last_decided_at = SYSUTCDATETIME(), last_decided_by = :actor
+            WHERE combo_id = :combo_id
+            """
+        ),
+        {"actor": actor, "combo_id": combo_id},
+    )
+
+
 def revert_broken_out_combo(engine, combo_id: int, actor: str) -> None:
     """Sends a Broken Out group (in progress OR fully complete) back for
     fresh whole-group review — discards every one of its individual item
@@ -1857,19 +1870,7 @@ def revert_broken_out_combo(engine, combo_id: int, actor: str) -> None:
     caller is responsible for warning that per-item work is discarded."""
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM dbo.dept_mapping_upc_overrides WHERE combo_id = :combo_id"), {"combo_id": combo_id})
-        conn.execute(
-            text(
-                """
-                UPDATE dbo.dept_mapping_combos
-                SET manual_department = NULL, decision_state = 'not_reviewed',
-                    decided_department = NULL, decided_via = NULL, approved = 0,
-                    rejected = CASE WHEN tier = 'auto' THEN 1 ELSE 0 END,
-                    last_decided_at = SYSUTCDATETIME(), last_decided_by = :actor
-                WHERE combo_id = :combo_id
-                """
-            ),
-            {"actor": actor, "combo_id": combo_id},
-        )
+        _reset_to_review(conn, combo_id, actor)
 
 
 def origin_tier(tier, n_evidence) -> str:
@@ -1905,19 +1906,7 @@ def revert_combo(engine, combo_id: int, actor: str) -> None:
     for a person instead of silently re-deciding it, and get_review_queue
     shows it in the queue it was promoted out of (see origin_tier)."""
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE dbo.dept_mapping_combos
-                SET manual_department = NULL, decision_state = 'not_reviewed',
-                    decided_department = NULL, decided_via = NULL, approved = 0,
-                    rejected = CASE WHEN tier = 'auto' THEN 1 ELSE 0 END,
-                    last_decided_at = SYSUTCDATETIME(), last_decided_by = :actor
-                WHERE combo_id = :combo_id
-                """
-            ),
-            {"actor": actor, "combo_id": combo_id},
-        )
+        _reset_to_review(conn, combo_id, actor)
 
 
 def confidence_label(tier: str, resolved_via, purity) -> str:
@@ -1984,7 +1973,7 @@ def get_manual_override_details(engine, upcs: list) -> dict:
     return {r["upc"]: dict(r) for r in rows}
 
 
-def add_department(engine, department: str) -> None:
+def add_department(engine, department: str, actor: str = None) -> None:
     """Manually adds a Department not yet in Scan Advantage's own data —
     e.g. a genuinely new one like "BULK" — immediately selectable
     everywhere a Department dropdown appears, no engine run needed.
@@ -2003,19 +1992,22 @@ def add_department(engine, department: str) -> None:
                 text("INSERT INTO dbo.dept_mapping_departments (department, source_type) VALUES (:department, 'manual')"),
                 {"department": department},
             )
+            log_activity(conn, actor, "Settings", "Added a Department", department)
 
 
-def remove_department(engine, department: str) -> None:
+def remove_department(engine, department: str, actor: str = None) -> None:
     """Removes a Department from the dropdown list. Only ever removes a
     MANUAL row — an 'auto' row (one of Scan Advantage's own real current
     Departments) can't be removed here since it would just reappear on
     the next engine run anyway; the underlying data would need to change
     first."""
     with engine.begin() as conn:
-        conn.execute(
+        n = conn.execute(
             text("DELETE FROM dbo.dept_mapping_departments WHERE department = :department AND source_type = 'manual'"),
             {"department": department.strip().upper()},
-        )
+        ).rowcount
+        if n:
+            log_activity(conn, actor, "Settings", "Removed a Department", department.strip().upper())
 
 
 def get_unmatched_defaults(engine) -> pd.DataFrame:
@@ -2027,6 +2019,96 @@ def get_unmatched_defaults(engine) -> pd.DataFrame:
             ),
             conn,
         )
+
+
+def unmatched_old_departments(engine) -> pd.DataFrame:
+    """One row per distributor Department text the Unmatched groups use —
+    the texts nothing in the data can place — with which sources use it,
+    how many groups / items it covers, its default (for every source) and
+    any per-source exceptions. Saved defaults whose text no Unmatched group
+    uses any more are listed too. Settings → Unmatched Department Defaults
+    is edited from this."""
+    with engine.connect() as conn:
+        used = pd.read_sql(text(
+            "SELECT source_key, UPPER(LTRIM(RTRIM(ISNULL(raw_department, '')))) AS old_department, "
+            "COUNT(*) AS n_groups, "
+            "SUM(CASE WHEN tier = 'unmatched' AND decision_state = 'not_reviewed' THEN 1 ELSE 0 END) AS n_waiting, "
+            "SUM(n_upcs_total) AS n_items "
+            "FROM dbo.dept_mapping_combos "
+            "WHERE tier = 'unmatched' OR (tier = 'auto' AND ISNULL(n_evidence, 0) = 0) "
+            "GROUP BY source_key, UPPER(LTRIM(RTRIM(ISNULL(raw_department, ''))))"), conn)
+        saved = pd.read_sql(text(
+            "SELECT source_key, UPPER(LTRIM(RTRIM(old_department))) AS old_department, new_department "
+            "FROM dbo.dept_mapping_unmatched_defaults"), conn)
+    anyrow = dict(zip(saved.loc[saved["source_key"] == "any", "old_department"], saved.loc[saved["source_key"] == "any", "new_department"]))
+    exact = saved[saved["source_key"] != "any"]
+    rows = []
+    for old in sorted(set(used["old_department"]) | set(saved["old_department"])):
+        u = used[used["old_department"] == old]
+        ex = exact[exact["old_department"] == old]
+        rows.append({
+            "old_department": old,
+            "sources": ", ".join(sorted(u["source_key"].str.upper())),
+            "n_groups": int(u["n_groups"].sum()), "n_waiting": int(u["n_waiting"].sum()), "n_items": int(u["n_items"].sum()),
+            "default": anyrow.get(old),
+            "exceptions": "; ".join(f"{r.source_key.upper()} → {r.new_department}" for r in ex.itertuples()) or None,
+        })
+    df = pd.DataFrame(rows, columns=["old_department", "sources", "n_groups", "n_waiting", "n_items", "default", "exceptions"])
+    df = df.astype(object).where(df.notna(), None)
+    return df.sort_values(["n_waiting", "n_items"], ascending=False, key=lambda c: c.astype(int)).reset_index(drop=True)
+
+
+def set_unmatched_default(conn, source_key: str, old_department: str, new_department: str | None, actor: str) -> None:
+    """Sets (or with None, clears) one default."""
+    old = old_department.strip().upper()
+    conn.execute(text("DELETE FROM dbo.dept_mapping_unmatched_defaults WHERE source_key = :s "
+                      "AND UPPER(LTRIM(RTRIM(old_department))) = :o"), {"s": source_key, "o": old})
+    if new_department:
+        conn.execute(text("INSERT INTO dbo.dept_mapping_unmatched_defaults (source_key, old_department, new_department, updated_by) "
+                          "VALUES (:s, :o, :n, :a)"), {"s": source_key, "o": old, "n": new_department, "a": actor})
+
+
+def department_usage(engine, department: str) -> dict:
+    """Everywhere a Department is in use — so removing one from the list
+    never leaves a decision, default or staged change pointing at a
+    Department nobody can pick any more."""
+    d = department.strip().upper()
+    q = {
+        "groups decided as it": "SELECT COUNT(*) FROM dbo.dept_mapping_combos WHERE UPPER(decided_department) = :d "
+                                "AND decision_state IN ('decided', 'not_reviewed')",
+        "item decisions": "SELECT COUNT(*) FROM dbo.dept_mapping_upc_overrides WHERE UPPER(department) = :d",
+        "staged group decisions": "SELECT COUNT(*) FROM dbo.dept_mapping_pending_changes WHERE UPPER(department) = :d",
+        "staged item decisions": "SELECT COUNT(*) FROM dbo.dept_mapping_pending_upc_changes WHERE UPPER(department) = :d",
+        "staged UPC overrides / adds": "SELECT COUNT(*) FROM dbo.item_master_pending_changes WHERE UPPER(department) = :d",
+        "UPC overrides": "SELECT COUNT(*) FROM dbo.manual_overrides WHERE UPPER(department) = :d",
+        "Unmatched Defaults": "SELECT COUNT(*) FROM dbo.dept_mapping_unmatched_defaults WHERE UPPER(new_department) = :d",
+        "items in the item master": "SELECT COUNT(*) FROM dbo.items WHERE UPPER(department) = :d",
+    }
+    with engine.connect() as conn:
+        return {k: int(conn.execute(text(sql), {"d": d}).scalar() or 0) for k, sql in q.items()}
+
+
+def department_usage_all(engine) -> pd.DataFrame:
+    """department_usage for every Department at once: one row per
+    Department, one column per place it can be used."""
+    q = {
+        "Groups": "SELECT UPPER(decided_department) d, COUNT(*) n FROM dbo.dept_mapping_combos "
+                  "WHERE decision_state IN ('decided', 'not_reviewed') GROUP BY UPPER(decided_department)",
+        "Item decisions": "SELECT UPPER(department) d, COUNT(*) n FROM dbo.dept_mapping_upc_overrides GROUP BY UPPER(department)",
+        "Staged": "SELECT d, SUM(n) n FROM (SELECT UPPER(department) d, COUNT(*) n FROM dbo.dept_mapping_pending_changes GROUP BY UPPER(department) "
+                  "UNION ALL SELECT UPPER(department), COUNT(*) FROM dbo.dept_mapping_pending_upc_changes GROUP BY UPPER(department) "
+                  "UNION ALL SELECT UPPER(department), COUNT(*) FROM dbo.item_master_pending_changes GROUP BY UPPER(department)) x GROUP BY d",
+        "UPC overrides": "SELECT UPPER(department) d, COUNT(*) n FROM dbo.manual_overrides GROUP BY UPPER(department)",
+        "Defaults": "SELECT UPPER(new_department) d, COUNT(*) n FROM dbo.dept_mapping_unmatched_defaults GROUP BY UPPER(new_department)",
+        "Items": "SELECT UPPER(department) d, COUNT(*) n FROM dbo.items GROUP BY UPPER(department)",
+    }
+    out = get_departments(engine)
+    out["key"] = out["department"].str.upper()
+    with engine.connect() as conn:
+        for col, sql in q.items():
+            m = dict(conn.execute(text(sql)).all())
+            out[col] = out["key"].map(m).fillna(0).astype(int)
+    return out.drop(columns="key")
 
 
 def save_unmatched_defaults(engine, rows: list, actor: str) -> None:
@@ -2046,7 +2128,8 @@ def save_unmatched_defaults(engine, rows: list, actor: str) -> None:
             )
 
 
-def approve_combo(engine, combo_id: int, department: str, actor: str, pushed_by: str | None = None) -> None:
+def approve_combo(engine, combo_id: int, department: str, actor: str, pushed_by: str | None = None,
+                  note: str | None = None) -> None:
     """A human confirms `department` for this combo's whole membership —
     manual_department is the durable record (never silently overwritten
     by a future engine run's fresh evidence; see _write_back). `actor` is
@@ -2055,6 +2138,11 @@ def approve_combo(engine, combo_id: int, department: str, actor: str, pushed_by:
     whoever happens to click Push; `pushed_by` records that separately,
     when known, so both survive independently."""
     with engine.begin() as conn:
+        # A whole-group decision on a group that was decided item by item
+        # replaces those item decisions — otherwise they'd keep winning over it.
+        conn.execute(text(
+            "DELETE FROM dbo.dept_mapping_upc_overrides WHERE combo_id = :c AND EXISTS (SELECT 1 FROM dbo.dept_mapping_combos "
+            "WHERE combo_id = :c AND decision_state IN ('broken_out', 'decided_broken_out'))"), {"c": combo_id})
         conn.execute(
             text(
                 """
@@ -2063,11 +2151,11 @@ def approve_combo(engine, combo_id: int, department: str, actor: str, pushed_by:
                     decided_department = :department, decided_via = 'Manually Reviewed',
                     approved = 1, rejected = 0,
                     last_decided_at = SYSUTCDATETIME(), last_decided_by = :actor,
-                    pushed_by = :pushed_by, pushed_at = SYSUTCDATETIME()
+                    pushed_by = :pushed_by, pushed_at = SYSUTCDATETIME(), decided_note = :note
                 WHERE combo_id = :combo_id
                 """
             ),
-            {"department": department, "actor": actor, "combo_id": combo_id, "pushed_by": pushed_by or actor},
+            {"department": department, "actor": actor, "combo_id": combo_id, "pushed_by": pushed_by or actor, "note": note},
         )
 
 
@@ -2270,7 +2358,7 @@ def get_recent_moves(engine) -> list:
         rows = conn.execute(
             text(
                 "SELECT move_id, combo_id, source_key, label, n_upcs_total, description, "
-                "snapshot_json, created_by, created_at "
+                "snapshot_json, created_by, created_at, origin_note "
                 "FROM dbo.dept_mapping_recent_moves ORDER BY move_id DESC"
             )
         ).mappings().all()
@@ -2279,6 +2367,7 @@ def get_recent_moves(engine) -> list:
             "move_id": r["move_id"], "combo_id": r["combo_id"], "source_key": r["source_key"],
             "label": r["label"], "n_upcs_total": r["n_upcs_total"], "description": r["description"],
             "snapshot": json.loads(r["snapshot_json"]), "created_by": r["created_by"], "created_at": r["created_at"],
+            "origin_note": r["origin_note"],
         }
         for r in rows
     ]
@@ -2303,7 +2392,7 @@ def _decision_signature(snapshot: dict) -> tuple:
 
 def record_recent_move(
     engine, combo_id: int, source_key: str, label: str, n_upcs_total: int,
-    description: str, snapshot: dict, actor: str,
+    description: str, snapshot: dict, actor: str, origin_note: str | None = None,
 ) -> None:
     """Pushes one Break Out/Send Back onto the combo's undo stack —
     `snapshot` is the state it was taken FROM. If the move lands the combo
@@ -2346,13 +2435,13 @@ def record_recent_move(
         conn.execute(
             text(
                 "INSERT INTO dbo.dept_mapping_recent_moves "
-                "(combo_id, source_key, label, n_upcs_total, description, snapshot_json, created_by) "
-                "VALUES (:combo_id, :source_key, :label, :n_upcs_total, :description, :snapshot_json, :created_by)"
+                "(combo_id, source_key, label, n_upcs_total, description, snapshot_json, created_by, origin_note) "
+                "VALUES (:combo_id, :source_key, :label, :n_upcs_total, :description, :snapshot_json, :created_by, :origin_note)"
             ),
             {
                 "combo_id": combo_id, "source_key": source_key, "label": label,
                 "n_upcs_total": n_upcs_total, "description": description,
-                "snapshot_json": json.dumps(snapshot), "created_by": actor,
+                "snapshot_json": json.dumps(snapshot), "created_by": actor, "origin_note": origin_note,
             },
         )
         # Capped PER COMBO, not globally — a global cap let unrelated combos'
@@ -2559,7 +2648,7 @@ def get_pending_changes(engine) -> dict:
         rows = conn.execute(
             text(
                 "SELECT combo_id, tier, department, source_key, label, n_upcs_total, staged_by, staged_at, "
-                "agreed_by, agreed_at, overridden_by, overridden_at FROM dbo.dept_mapping_pending_changes"
+                "agreed_by, agreed_at, overridden_by, overridden_at, origin_note FROM dbo.dept_mapping_pending_changes"
             ),
         ).mappings().all()
     return {
@@ -2569,6 +2658,7 @@ def get_pending_changes(engine) -> dict:
             "staged_by": r["staged_by"], "staged_at": r["staged_at"],
             "agreed_by": r["agreed_by"], "agreed_at": r["agreed_at"],
             "overridden_by": r["overridden_by"], "overridden_at": r["overridden_at"],
+            "origin_note": r["origin_note"],
         }
         for r in rows
     }
@@ -2811,18 +2901,23 @@ def _resolve_combo(conn, combo_id: int, department: str, suggestion_rows, agreed
     differently); True once a genuine multi-department disagreement has
     actually been resolved."""
     winner = next(r for r in suggestion_rows if r["department"] == department)
+    # Where the decision came from (e.g. the one-time old-workbook import)
+    # stays with it while it's the same Department; a changed one drops it.
+    prior = conn.execute(text("SELECT department, origin_note FROM dbo.dept_mapping_pending_changes WHERE combo_id = :c"),
+                         {"c": combo_id}).mappings().first()
+    note = prior["origin_note"] if prior and prior["department"] == department else None
     conn.execute(text("DELETE FROM dbo.dept_mapping_pending_changes WHERE combo_id = :combo_id"), {"combo_id": combo_id})
     conn.execute(
         text(
             "INSERT INTO dbo.dept_mapping_pending_changes "
-            "(combo_id, tier, department, source_key, label, n_upcs_total, staged_by, agreed_by, agreed_at, is_saved) "
+            "(combo_id, tier, department, source_key, label, n_upcs_total, staged_by, agreed_by, agreed_at, is_saved, origin_note) "
             "VALUES (:combo_id, :tier, :department, :source_key, :label, :n_upcs_total, :staged_by, :agreed_by, "
-            + ("SYSUTCDATETIME()" if agreed_by else "NULL") + ", 1)"
+            + ("SYSUTCDATETIME()" if agreed_by else "NULL") + ", 1, :note)"
         ),
         {
             "combo_id": combo_id, "tier": winner.get("tier"), "department": department,
             "source_key": winner.get("source_key"), "label": winner.get("label"), "n_upcs_total": winner.get("n_upcs_total"),
-            "staged_by": winner["staged_by"], "agreed_by": agreed_by,
+            "staged_by": winner["staged_by"], "agreed_by": agreed_by, "note": note,
         },
     )
     if clear_suggestions:
@@ -2913,26 +3008,10 @@ def get_pending_upc_changes(engine) -> dict:
         rows = conn.execute(
             text(
                 "SELECT upc, combo_id, department, label, description, source_key, staged_by, staged_at, "
-                "revised_by, revised_at, overridden_by, overridden_at FROM dbo.dept_mapping_pending_upc_changes"
+                "revised_by, revised_at, overridden_by, overridden_at, origin_note FROM dbo.dept_mapping_pending_upc_changes"
             ),
         ).mappings().all()
     return {r["upc"]: dict(r) for r in rows}
-
-
-def get_upc_backers(engine, upcs) -> dict:
-    """{upc: owner} for RESOLVED UPCs — who currently owns (decided) each
-    one. Kept as a dict-of-sets for call-site compatibility with the combo
-    version, even though a UPC only ever has one owner now."""
-    if not upcs:
-        return {}
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT upc, staged_by FROM dbo.dept_mapping_pending_upc_changes WHERE upc IN (SELECT v FROM OPENJSON(:upcs) WITH (v VARCHAR(400) '$'))").bindparams(
-                bindparam("upcs", type_=JSON_LIST)
-            ),
-            {"upcs": list(upcs)},
-        ).mappings().all()
-    return {r["upc"]: {r["staged_by"]} for r in rows}
 
 
 def stage_broken_out_decisions(engine, changes: dict, actor: str, is_admin: bool = False) -> dict:
@@ -3014,17 +3093,25 @@ def stage_broken_out_decisions(engine, changes: dict, actor: str, is_admin: bool
                 sugg_rows,
             )
         if decided_rows:
+            prior = {}
             for chunk in _chunks([r["upc"] for r in decided_rows]):
+                prior.update({r[0]: (r[1], r[2]) for r in conn.execute(
+                    text("SELECT upc, department, origin_note FROM dbo.dept_mapping_pending_upc_changes "
+                         "WHERE upc IN (SELECT v FROM OPENJSON(:upcs) WITH (v VARCHAR(400) '$'))")
+                    .bindparams(bindparam("upcs", type_=JSON_LIST)), {"upcs": chunk}).all()})
                 conn.execute(
                     text("DELETE FROM dbo.dept_mapping_pending_upc_changes WHERE upc IN (SELECT v FROM OPENJSON(:upcs) WITH (v VARCHAR(400) '$'))")
                     .bindparams(bindparam("upcs", type_=JSON_LIST)),
                     {"upcs": chunk},
                 )
+            for r in decided_rows:  # a note stays while the Department does
+                old = prior.get(r["upc"])
+                r["origin_note"] = changes[r["upc"]].get("origin_note") or (old[1] if old and old[0] == r["department"] else None)
             conn.execute(
                 text(
                     "INSERT INTO dbo.dept_mapping_pending_upc_changes "
-                    "(upc, combo_id, department, label, description, source_key, staged_by, is_saved) "
-                    "VALUES (:upc, :combo_id, :department, :label, :description, :source_key, :staged_by, 1)"
+                    "(upc, combo_id, department, label, description, source_key, staged_by, is_saved, origin_note) "
+                    "VALUES (:upc, :combo_id, :department, :label, :description, :source_key, :staged_by, 1, :origin_note)"
                 ),
                 decided_rows,
             )
@@ -3394,10 +3481,6 @@ def withdraw_combo_suggestion(engine, combo_id: int, actor: str) -> dict:
         return {"resolved": True, "departments": [sole_dept], "withdrew": True}
 
 
-def delete_pending_upc_change(engine, upc: str) -> None:
-    delete_pending_upc_changes(engine, [upc])
-
-
 def delete_pending_upc_changes(engine, upcs: list) -> None:
     if not upcs:
         return
@@ -3515,11 +3598,6 @@ def dismiss_discard_notices(engine, notice_ids: list) -> None:
         )
 
 
-def dismiss_all_discard_notices(engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.change_discard_notices SET dismissed = 1 WHERE dismissed = 0"))
-
-
 def clear_pending_for_combo(engine, combo_id: int) -> None:
     """A department decision staged for a combo (Approve, or per-item
     Department choices from Broken Out) is only ever valid given the
@@ -3551,7 +3629,7 @@ def get_item_master_pending(engine) -> dict:
         rows = conn.execute(
             text(
                 "SELECT upc, change_type, description, department, category, subcategory, brand, "
-                "pack, size, uom, source_key, staged_by, staged_at FROM dbo.item_master_pending_changes"
+                "pack, size, uom, source_key, staged_by, staged_at, origin_note FROM dbo.item_master_pending_changes"
             ),
         ).mappings().all()
     return {
@@ -3560,6 +3638,7 @@ def get_item_master_pending(engine) -> dict:
             "category": r["category"], "subcategory": r["subcategory"], "brand": r["brand"],
             "pack": r["pack"], "size": r["size"], "uom": r["uom"],
             "source_key": r["source_key"], "staged_by": r["staged_by"], "staged_at": r["staged_at"],
+            "origin_note": r["origin_note"],
         }
         for r in rows
     }
@@ -3612,7 +3691,7 @@ def save_item_master_pending_bulk(engine, changes: dict, actor: str) -> dict:
             existing.update({
                 r["upc"]: dict(r) for r in conn.execute(
                     text(
-                        "SELECT upc, change_type, description, department, staged_by, staged_at "
+                        "SELECT upc, change_type, description, department, staged_by, staged_at, origin_note "
                         "FROM dbo.item_master_pending_changes WHERE upc IN (SELECT v FROM OPENJSON(:upcs) WITH (v VARCHAR(400) '$'))"
                     ).bindparams(bindparam("upcs", type_=JSON_LIST)),
                     {"upcs": chunk},
@@ -3629,8 +3708,8 @@ def save_item_master_pending_bulk(engine, changes: dict, actor: str) -> dict:
         conn.execute(
             text(
                 "INSERT INTO dbo.item_master_pending_changes "
-                "(upc, change_type, description, department, category, subcategory, brand, pack, size, uom, source_key, is_saved, staged_by) "
-                "VALUES (:upc, :change_type, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :source_key, 1, :staged_by)"
+                "(upc, change_type, description, department, category, subcategory, brand, pack, size, uom, source_key, is_saved, staged_by, origin_note) "
+                "VALUES (:upc, :change_type, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :source_key, 1, :staged_by, :origin_note)"
             ),
             [
                 {
@@ -3639,10 +3718,19 @@ def save_item_master_pending_bulk(engine, changes: dict, actor: str) -> dict:
                     "subcategory": c.get("subcategory"), "brand": c.get("brand"),
                     "pack": c.get("pack"), "size": c.get("size"), "uom": c.get("uom"),
                     "source_key": c.get("source_key"), "staged_by": actor,
+                    # a note stays while the Department does
+                    "origin_note": c.get("origin_note") or (
+                        existing[upc].get("origin_note") if upc in existing and existing[upc].get("department") == c.get("department") else None),
                 }
                 for upc, c in to_write.items()
             ],
         )
+        kinds = Counter(c["change_type"] for c in to_write.values())
+        names = {"add": "item(s) to add", "delete": "item(s) to delete", "edit": "UPC override(s) / item edit(s)"}
+        depts = Counter(c.get("department") for c in to_write.values() if c["change_type"] == "edit" and c.get("department"))
+        log_activity(conn, actor, "Items", "Staged " + ", ".join(f"{n:,} {names.get(k, k)}" for k, n in kinds.items()),
+                     ", ".join(list(to_write)[:5]) + (f" … (+{len(to_write) - 5:,} more)" if len(to_write) > 5 else ""),
+                     len(to_write), details={"upcs": list(to_write)[:2000], "departments": dict(depts)})
     return blocked
 
 
@@ -3687,18 +3775,25 @@ def push_item_master_edits(engine, changes: dict, actor: str) -> None:
         for u, c in changes.items():
             changed = tuple(f for f in ITEM_EDIT_FIELDS if norm(c.get(f)) != norm(live.get(u, {}).get(f)))
             if changed:
-                by_fields.setdefault(changed, []).append({"upc": u, "updated_by": actor, **{f: c.get(f) for f in changed}})
+                by_fields.setdefault(changed, []).append({"upc": u, "updated_by": actor, "note": c.get("origin_note"),
+                                                          **{f: c.get(f) for f in changed}})
         for changed, rows in by_fields.items():
+            # the note describes the Department — a new Department replaces it
+            note_set = ", decided_note = :note" if "department" in changed else ""
             conn.execute(text(f"""
                 MERGE dbo.manual_overrides AS target
                 USING (SELECT :upc AS upc) AS src ON target.upc = src.upc
                 WHEN MATCHED THEN UPDATE SET {", ".join(f"{f} = :{f}" for f in changed)},
-                    updated_by = :updated_by, updated_at = SYSUTCDATETIME()
-                WHEN NOT MATCHED THEN INSERT (upc, {", ".join(changed)}, updated_by)
-                    VALUES (:upc, {", ".join(":" + f for f in changed)}, :updated_by);"""), rows)
+                    updated_by = :updated_by, updated_at = SYSUTCDATETIME(){note_set}
+                WHEN NOT MATCHED THEN INSERT (upc, {", ".join(changed)}, updated_by, decided_note)
+                    VALUES (:upc, {", ".join(":" + f for f in changed)}, :updated_by, :note);"""), rows)
         for chunk in _chunks(list(changes)):
             conn.execute(text("DELETE FROM dbo.item_master_pending_changes WHERE upc IN (SELECT v FROM OPENJSON(:u) WITH (v VARCHAR(400) '$'))")
                          .bindparams(bindparam("u", type_=JSON_LIST)), {"u": chunk})
+        stagers = Counter(c.get("staged_by") or "?" for c in changes.values())
+        log_activity(conn, actor, "Pushed live", f"Pushed {len(changes):,} UPC override(s) / item edit(s)",
+                     "staged by " + ", ".join(f"{k} ({n:,})" for k, n in stagers.items()),
+                     len(changes), details={"upcs": list(changes)[:2000]})
 
 
 # ---------------------------------------------------------------------------
@@ -3766,6 +3861,8 @@ def save_source_pending_change(
                 "staged_by": actor, **{col: config.get(col) for col in SOURCE_CONFIG_COLUMNS},
             },
         )
+        log_activity(conn, actor, "Sources", "Staged a new source" if change_type == "add" else "Staged a source edit",
+                     source_key, details={c: config.get(c) for c in SOURCE_CONFIG_COLUMNS})
 
 
 def delete_source_pending_change(engine, source_key: str) -> None:
@@ -3879,7 +3976,9 @@ SNAPSHOT_FULL_TABLES = (
     # Department Review Settings — small, and a restore should put them back too.
     "dept_mapping_departments", "dept_mapping_strict_departments", "dept_mapping_unmatched_defaults",
     "dept_mapping_config", "dept_mapping_keyword_rules",
-    "merge_added_items",
+    "merge_added_items", "dept_settings_requests",
+    # a workbook upload's "which is right?" questions, alongside the work it staged
+    "import_choices",
 )
 # Captured like the tables above, but restored by _restore_sources: raw data
 # hangs off each source (too big to snapshot), so a source is updated in
@@ -3932,9 +4031,9 @@ def _restore_full_tables(conn, snapshot_id: int) -> bool:
     if not stored:
         return False
     for t in SNAPSHOT_FULL_TABLES:
-        if t not in stored:
-            continue
         conn.execute(text(f"DELETE FROM dbo.{t}"))
+        if t not in stored:
+            continue  # the snapshot is older than this table: it was empty then
         cols = _openjson_columns(conn, t)
         names = ", ".join(f"[{c}]" for c, _ in cols)
         with_clause = ", ".join(f"[{c}] {typ} '$.\"{c}\"'" for c, typ in cols)
@@ -4014,12 +4113,12 @@ def take_snapshot(engine, actor: str, label: str = None, kind: str = "manual", r
                 "tier, purity, n_evidence, resolved_via, decision_state, decided_department, decided_via, "
                 "suggested_department, majority_department, chain_round, is_strict, manual_department, approved, rejected, "
                 "is_new_this_run, is_stale, first_seen_at, last_computed_at, last_decided_at, last_decided_by, "
-                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at) "
+                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at, decided_note) "
                 "SELECT :snapshot_id, combo_id, source_key, raw_department, raw_category, raw_subcategory, "
                 "tier, purity, n_evidence, resolved_via, decision_state, decided_department, decided_via, "
                 "suggested_department, majority_department, chain_round, is_strict, manual_department, approved, rejected, "
                 "is_new_this_run, is_stale, first_seen_at, last_computed_at, last_decided_at, last_decided_by, "
-                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at "
+                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_combos"
             ),
             {"snapshot_id": snapshot_id},
@@ -4028,9 +4127,9 @@ def take_snapshot(engine, actor: str, label: str = None, kind: str = "manual", r
             text(
                 "INSERT INTO dbo.dept_mapping_upc_overrides_snapshot "
                 "(snapshot_id, upc, combo_id, department, decided_via, suggested_department, suggested_via, "
-                "updated_by, updated_at, pushed_by, pushed_at) "
+                "updated_by, updated_at, pushed_by, pushed_at, decided_note) "
                 "SELECT :snapshot_id, upc, combo_id, department, decided_via, suggested_department, suggested_via, "
-                "updated_by, updated_at, pushed_by, pushed_at "
+                "updated_by, updated_at, pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_upc_overrides"
             ),
             {"snapshot_id": snapshot_id},
@@ -4091,7 +4190,9 @@ def take_snapshot(engine, actor: str, label: str = None, kind: str = "manual", r
         details["live"] = _live_extra(conn)
         conn.execute(text("UPDATE dbo.dept_mapping_snapshots SET details_json = :d WHERE snapshot_id = :s"),
                      {"d": json.dumps(details, default=str), "s": snapshot_id})
-    if kind != "manual":
+    if kind == "manual":
+        log_activity(engine, actor, "Snapshots", f"Took snapshot #{snapshot_id}", label)
+    else:
         prune_snapshots(engine)
     return snapshot_id
 
@@ -4116,6 +4217,7 @@ SNAPSHOT_KINDS = {
     "monthly": "Monthly",
     "safety_merge": "Automatic — before a Merge push",
     "safety_restore": "Automatic — before a restore",
+    "safety_import": "Automatic — before a workbook upload",
 }
 
 
@@ -4127,7 +4229,7 @@ def prune_snapshots(engine) -> list:
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT snapshot_id, kind FROM dbo.dept_mapping_snapshots ORDER BY snapshot_id DESC")).all()
-    safety = [r[0] for r in rows if r[1] in ("safety_merge", "safety_restore")]
+    safety = [r[0] for r in rows if r[1] in ("safety_merge", "safety_restore", "safety_import")]
     last_restore = next((r[0] for r in rows if r[1] == "safety_restore"), None)
     monthly = [r[0] for r in rows if r[1] == "monthly"]
     gone = [i for i in safety[KEEP_SAFETY_SNAPSHOTS:] if i != last_restore] + monthly[KEEP_MONTHLY_SNAPSHOTS:]
@@ -4308,9 +4410,20 @@ def has_snapshot_this_month(engine) -> bool:
 def restore_snapshot(engine, snapshot_id: int, actor: str) -> int:
     """Always takes its own safety snapshot of whatever's live right now,
     labeled to say why, before overwriting anything — restoring a snapshot
-    must never be the one action you can't come back from."""
+    must never be the one action you can't come back from. Refuses a
+    snapshot that doesn't exist or holds no items (it would empty the item
+    master)."""
+    with engine.connect() as conn:
+        exists = conn.execute(text("SELECT item_count FROM dbo.dept_mapping_snapshots WHERE snapshot_id = :s"),
+                              {"s": snapshot_id}).first()
+        held = conn.execute(text("SELECT COUNT(*) FROM dbo.items_snapshot WHERE snapshot_id = :s"), {"s": snapshot_id}).scalar()
+    if exists is None:
+        raise ValueError(f"Snapshot #{snapshot_id} doesn't exist.")
+    if not held:
+        raise ValueError(f"Snapshot #{snapshot_id} holds no items — restoring it would empty the item master.")
     safety_id = take_snapshot(engine, actor, label=f"Auto-safety before restoring snapshot #{snapshot_id}",
                               kind="safety_restore", restored_from=snapshot_id)
+    log_activity(engine, actor, "Snapshots", f"Restored snapshot #{snapshot_id} (today's data saved first as #{safety_id})")
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM dbo.items"))
         conn.execute(
@@ -4334,12 +4447,12 @@ def restore_snapshot(engine, snapshot_id: int, actor: str) -> int:
                 "tier, purity, n_evidence, resolved_via, decision_state, decided_department, decided_via, "
                 "suggested_department, majority_department, chain_round, is_strict, manual_department, approved, rejected, "
                 "is_new_this_run, is_stale, first_seen_at, last_computed_at, last_decided_at, last_decided_by, "
-                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at) "
+                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at, decided_note) "
                 "SELECT combo_id, source_key, raw_department, raw_category, raw_subcategory, "
                 "tier, purity, n_evidence, resolved_via, decision_state, decided_department, decided_via, "
                 "suggested_department, majority_department, chain_round, is_strict, manual_department, approved, rejected, "
                 "is_new_this_run, is_stale, first_seen_at, last_computed_at, last_decided_at, last_decided_by, "
-                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at "
+                "runner_up_department, runner_up_share, n_upcs_total, pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_combos_snapshot WHERE snapshot_id = :snapshot_id"
             ),
             {"snapshot_id": snapshot_id},
@@ -4357,9 +4470,9 @@ def restore_snapshot(engine, snapshot_id: int, actor: str) -> int:
             text(
                 "INSERT INTO dbo.dept_mapping_upc_overrides "
                 "(upc, combo_id, department, decided_via, suggested_department, suggested_via, updated_by, updated_at, "
-                "pushed_by, pushed_at) "
+                "pushed_by, pushed_at, decided_note) "
                 "SELECT upc, combo_id, department, decided_via, suggested_department, suggested_via, updated_by, updated_at, "
-                "pushed_by, pushed_at "
+                "pushed_by, pushed_at, decided_note "
                 "FROM dbo.dept_mapping_upc_overrides_snapshot WHERE snapshot_id = :snapshot_id"
             ),
             {"snapshot_id": snapshot_id},
@@ -4430,6 +4543,19 @@ def delete_snapshot(engine, snapshot_id: int) -> None:
         conn.execute(text("DELETE FROM dbo.dept_mapping_pending_upc_changes_snapshot WHERE snapshot_id = :sid"), {"sid": snapshot_id})
         conn.execute(text("DELETE FROM dbo.dept_mapping_snapshot_tables WHERE snapshot_id = :sid"), {"sid": snapshot_id})
         conn.execute(text("DELETE FROM dbo.dept_mapping_snapshots WHERE snapshot_id = :sid"), {"sid": snapshot_id})
+    _renumber_next_snapshot(engine)
+
+
+def _renumber_next_snapshot(engine) -> None:
+    """Keeps snapshot numbers small: the next snapshot gets the number right
+    after the highest one still kept (#0 when none are left), instead of
+    counting on from every snapshot ever taken."""
+    try:
+        with engine.begin() as conn:
+            top = conn.execute(text("SELECT MAX(snapshot_id) FROM dbo.dept_mapping_snapshots")).scalar()
+            conn.execute(text(f"DBCC CHECKIDENT ('dbo.dept_mapping_snapshots', RESEED, {-1 if top is None else int(top)})"))
+    except Exception:
+        pass  # numbering is cosmetic; never fail a delete over it
 
 
 # ---------------------------------------------------------------------------
@@ -4594,47 +4720,6 @@ def combo_decision_map(engine) -> dict:
             "SELECT combo_id, tier, decision_state, decided_department FROM dbo.dept_mapping_combos"))}
 
 
-def reapply_rules(engine, apply: bool = False) -> dict:
-    """The "re-run everything" safety net, without taking anything from
-    source files: checks every live item against manual overrides, manual
-    deletions and manually added items, and every Department Review
-    decision, and (with apply=True) fixes only the rows that are out of
-    line. Normally everything is already applied the moment it's pushed,
-    so this finds nothing. Returns counts per kind."""
-    fields = ["description", "department", "category", "subcategory", "brand", "pack", "size", "uom"]
-    counts = {}
-    with engine.begin() if apply else engine.connect() as conn:
-        for f in fields:
-            where = (f"FROM dbo.items i JOIN dbo.manual_overrides o ON o.upc = i.upc "
-                     f"WHERE ISNULL(o.{f}, '') <> '' AND ISNULL(i.{f}, '') <> o.{f}")
-            counts[f"override_{f}"] = conn.execute(text(f"SELECT COUNT(*) {where}")).scalar()
-            if apply and counts[f"override_{f}"]:
-                conn.execute(text(f"UPDATE i SET {f} = o.{f}, updated_at = SYSUTCDATETIME() {where}"))
-        counts["deleted_still_live"] = conn.execute(text(
-            "SELECT COUNT(*) FROM dbo.items i JOIN dbo.deleted_upcs d ON d.upc = i.upc")).scalar()
-        counts["manual_missing"] = conn.execute(text(
-            "SELECT COUNT(*) FROM dbo.manual_overrides o WHERE NOT EXISTS (SELECT 1 FROM dbo.items i WHERE i.upc = o.upc) "
-            "AND NOT EXISTS (SELECT 1 FROM dbo.deleted_upcs d WHERE d.upc = o.upc) "
-            "AND NOT EXISTS (SELECT 1 FROM dbo.raw_items r WHERE r.upc = o.upc)")).scalar()
-        if apply:
-            conn.execute(text("DELETE i FROM dbo.items i JOIN dbo.deleted_upcs d ON d.upc = i.upc"))
-            conn.execute(text(
-                f"INSERT INTO dbo.items (upc, {', '.join(fields)}, source_key) "
-                "SELECT o.upc, COALESCE(NULLIF(o.description, ''), o.upc), "
-                + ", ".join(f"NULLIF(o.{c}, '')" for c in fields[1:])
-                + ", 'manual' FROM dbo.manual_overrides o WHERE NOT EXISTS (SELECT 1 FROM dbo.items i WHERE i.upc = o.upc) "
-                "AND NOT EXISTS (SELECT 1 FROM dbo.deleted_upcs d WHERE d.upc = o.upc) "
-                "AND NOT EXISTS (SELECT 1 FROM dbo.raw_items r WHERE r.upc = o.upc)"))
-    if apply:
-        counts["departments"] = sync_item_departments(engine)["items"]
-    else:
-        df = _department_targets(engine, "items")
-        blank = lambda v: v is None or (isinstance(v, float) and pd.isna(v)) or v == ""
-        counts["departments"] = sum((None if blank(a) else a) != (None if blank(b) else b)
-                                    for a, b in zip(df["department"], df["target"]))
-    return counts
-
-
 def sync_item_departments(engine) -> dict:
     """Brings Department in the live item master (and in any computed Merge
     draft) in line with Department Review's current decisions and manual
@@ -4653,7 +4738,7 @@ def sync_item_departments(engine) -> dict:
             conn.execute(text("CREATE TABLE #dept_sync (upc VARCHAR(12) PRIMARY KEY, department NVARCHAR(200) NULL)"))
             conn.execute(
                 text("INSERT INTO #dept_sync (upc, department) VALUES (:upc, :department)"),
-                [{"upc": u, "department": d} for u, d in zip(diff["upc"], diff["target"])],
+                [{"upc": u, "department": None if blank(d) else d} for u, d in zip(diff["upc"], diff["target"])],
             )
             touch = ", updated_at = SYSUTCDATETIME()" if table == "items" else ""
             conn.execute(text(
@@ -5175,8 +5260,9 @@ def start_visit(engine, username: str) -> datetime:
 
 
 NOTIFICATION_KINDS = {
-    "suggestion": "Suggestions on your items", "undo": "Undo requests", "claim": "Your claimed groups",
+    "suggestion": "Suggestions on your items", "undo": "Undo requests", "claim": "Groups you're working on",
     "discarded": "Discarded work", "pushed": "Pushed live", "moved": "Groups moved", "dispute": "Needs agreement",
+    "request": "Settings requests",
 }
 
 
@@ -5212,7 +5298,7 @@ def _combo_labels(conn, combo_ids) -> dict:
     return out
 
 
-def get_notifications(engine, username: str, since: datetime) -> dict:
+def get_notifications(engine, username: str, since: datetime, is_admin: bool = False) -> dict:
     """Everything worth telling `username` about, in two groups:
 
     "action" — waiting on YOU right now (shown until handled, flagged new if
@@ -5323,7 +5409,7 @@ def get_notifications(engine, username: str, since: datetime) -> dict:
                        "when": when, "new": when is not None and when > since, "kind": kind})
 
     for r in sugg:
-        entry(action, r["combo_id"], f"{r['suggested_by']} suggested a change on {r['n']} of your item(s) — accept or deny", r["latest"], "suggestion")
+        entry(action, r["combo_id"], f"{r['suggested_by']} suggested a different Department on {r['n']} of your item(s) — accept or deny", r["latest"], "suggestion")
     for r in combo_undo:
         entry(action, r["combo_id"], f"{r['requested_by']} asked you to undo your decision", r["requested_at"], "undo")
     if group_undo:
@@ -5335,8 +5421,7 @@ def get_notifications(engine, username: str, since: datetime) -> dict:
     for r in claims:
         left = max(0, CLAIM_IDLE_MINUTES - r["idle"])
         entry(action, r["combo_id"],
-              "You've claimed this Broken Out group — nobody else can bulk-decide its items until you release it "
-              f"(auto-releases after {left} more minute(s) idle)", r["claimed_at"], "claim", tab="Broken Out")
+              f"You're working on this Broken Out group (frees up after {left} min idle)", r["claimed_at"], "claim", tab="Broken Out")
     for r in discarded:
         who = r["triggered_by"] or "a Merge"
         kind = "replaced by an admin override" if "overrode" in (r["reason"] or "").lower() else "discarded"
@@ -5356,7 +5441,7 @@ def get_notifications(engine, username: str, since: datetime) -> dict:
             for rows in staged.values() for row in rows
         )
         if involved:
-            entry(updates, r["combo_id"], f"{r['created_by']}: {r['description']} (undoable from Recent moves)", r["created_at"], "moved")
+            entry(updates, r["combo_id"], f"{r['created_by']}: {r['description']}", r["created_at"], "moved")
     for r in disputes:
         entry(updates, r["combo_id"], ("A dispute you're in changed" if r["mine"] else "New group needs agreement")
               + f" — {r['depts']} different departments suggested", r["latest"], "dispute")
@@ -5365,10 +5450,146 @@ def get_notifications(engine, username: str, since: datetime) -> dict:
             entry(updates, r["combo_id"], ("Item suggestions on a group you're in" if r["mine"] else "New item suggestions need agreement")
                   + f" — {r['n']} item(s)", r["latest"], "dispute")
 
+    # --- Settings requests: admins are asked to review; editors hear back --
+    for r in list_settings_requests(engine, status="pending") if is_admin else []:
+        entry(action, None, f"{r['requested_by']} asks: {r['summary'].replace('**', '')} — approve or deny", r["requested_at"],
+              "request", title=f"Settings request #{r['request_id']}", tab="Settings")
+    for r in list_settings_requests(engine, requested_by=username):
+        if r["status"] in ("approved", "denied") and r["decided_at"] and r["decided_at"] > since:
+            note = f" — “{r['admin_note']}”" if r.get("admin_note") else ""
+            entry(updates, None, f"{r['decided_by']} {r['status']} your request: {r['summary'].replace('**', '')}{note}",
+                  r["decided_at"], "request", title=f"Settings request #{r['request_id']}", tab="Settings")
+
     newest_first = lambda e: e["when"] or datetime.min
     action.sort(key=newest_first, reverse=True)
     updates.sort(key=newest_first, reverse=True)
     return {"action": action, "updates": updates}
+
+
+# ---------------------------------------------------------------------------
+# Activity log — a permanent record of who changed what, for the admin
+# Activity report. Separate from the undo history (which is short-lived and
+# trimmed) and never touched by a snapshot restore.
+# ---------------------------------------------------------------------------
+ACTIVITY_AREAS = ["Department Review", "Pushed live", "Undo / Redo", "Items", "Sources", "Settings",
+                  "Uploads & Merge", "Snapshots"]
+
+
+ACTIVITY_VIAS = ["In the app", "Department workbook upload", "Group Excel file", "Spreadsheet upload",
+                 "Monthly refresh", "File upload", "Undo / Redo"]
+_via = threading.local()
+
+
+class activity_via:
+    """Everything logged inside `with activity_via("Monthly refresh"):` says
+    that's how it was made."""
+
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        self.prev = getattr(_via, "v", None)
+        _via.v = self.label
+
+    def __exit__(self, *exc):
+        _via.v = self.prev
+
+
+def _infer_via(area: str, action: str) -> str:
+    if area == "Undo / Redo":
+        return "Undo / Redo"
+    if re.search(r"workbook", action or "", re.I):
+        return "Department workbook upload"
+    if re.search(r"from .+\.(xlsx|xls|csv)\b", action or "", re.I):
+        return "Group Excel file"
+    if area == "Uploads & Merge" and (action or "").startswith("Uploaded"):
+        return "File upload"
+    return "In the app"
+
+
+def log_activity(conn_or_engine, actor: str, area: str, action: str, target: str = None, n_items: int = None,
+                 combo_id: int = None, details=None, via: str = None) -> None:
+    """One line in the activity log. Never fails the change it describes."""
+    if not actor:
+        return
+    via = via or getattr(_via, "v", None) or _infer_via(area, action)
+    params = {"via": via, "a": actor, "ar": area, "ac": action[:400], "t": (target or None) and str(target)[:600],
+              "n": None if n_items is None else int(n_items), "c": None if combo_id is None else int(combo_id),
+              "d": None if details is None else (details if isinstance(details, str) else json.dumps(details, default=str))}
+    sql = text("INSERT INTO dbo.activity_log (actor, area, action, target, n_items, combo_id, details, via) "
+               "VALUES (:a, :ar, :ac, :t, :n, :c, :d, :via)")
+    try:
+        if hasattr(conn_or_engine, "begin") and not hasattr(conn_or_engine, "in_transaction"):
+            with conn_or_engine.begin() as conn:
+                conn.execute(sql, params)
+        else:
+            with conn_or_engine.begin_nested():
+                conn_or_engine.execute(sql, params)
+    except Exception:
+        pass
+
+
+def list_activity(engine, since=None, until=None, actors=None, areas=None, limit: int = 20000) -> pd.DataFrame:
+    where, p = ["1 = 1"], {}
+    if since is not None:
+        where.append("at >= :since"); p["since"] = since
+    if until is not None:
+        where.append("at < :until"); p["until"] = until
+    sql = (f"SELECT TOP {int(limit)} activity_id, at, actor, area, action, target, n_items, combo_id, details, "
+           "ISNULL(via, 'In the app') AS via "
+           f"FROM dbo.activity_log WHERE {' AND '.join(where)} ORDER BY activity_id DESC")
+    with engine.connect() as conn:
+        df = pd.read_sql(text(sql), conn, params=p)
+    if actors:
+        df = df[df["actor"].isin(actors)]
+    if areas:
+        df = df[df["area"].isin(areas)]
+    return df.reset_index(drop=True)
+
+
+def staged_work_by_person(engine) -> pd.DataFrame:
+    """What each person has staged right now and not pushed yet."""
+    sql = """
+        SELECT staged_by AS person, 'Group decisions' AS what, COUNT(*) AS n_changes, SUM(n_upcs_total) AS n_items
+          FROM dbo.dept_mapping_pending_changes GROUP BY staged_by
+        UNION ALL
+        SELECT staged_by, 'Votes on disputed groups', COUNT(*), SUM(n_upcs_total)
+          FROM dbo.dept_mapping_combo_suggestions GROUP BY staged_by
+        UNION ALL
+        SELECT staged_by, 'Broken Out item decisions', COUNT(*), COUNT(*)
+          FROM dbo.dept_mapping_pending_upc_changes GROUP BY staged_by
+        UNION ALL
+        SELECT suggested_by, 'Suggestions on others'' items', COUNT(*), COUNT(*)
+          FROM dbo.dept_mapping_upc_change_suggestions GROUP BY suggested_by
+        UNION ALL
+        SELECT staged_by, CASE change_type WHEN 'add' THEN 'Items to add' WHEN 'delete' THEN 'Items to delete'
+               ELSE 'UPC overrides / item edits' END, COUNT(*), COUNT(*)
+          FROM dbo.item_master_pending_changes GROUP BY staged_by, change_type
+        UNION ALL
+        SELECT staged_by, CASE change_type WHEN 'add' THEN 'New sources' ELSE 'Source edits' END, COUNT(*), NULL
+          FROM dbo.source_pending_changes GROUP BY staged_by, change_type
+    """
+    with engine.connect() as conn:
+        df = pd.read_sql(text(sql), conn)
+    df["person"] = df["person"].fillna("(unknown)")
+    return df.sort_values(["person", "what"]).reset_index(drop=True)
+
+
+def retire_undo_for_combos(engine, combo_ids) -> int:
+    """A push makes a group's decision the live data: nobody's top-bar Undo
+    / Redo steps on it apply any more (going back is a Send Back from now
+    on, which is itself undoable). Returns how many steps were retired."""
+    ids = [int(c) for c in combo_ids]
+    if not ids:
+        return 0
+    n = 0
+    with engine.begin() as conn:
+        for chunk in _chunks(ids):
+            n += conn.execute(text(
+                "UPDATE dbo.dept_mapping_action_log SET status = 'pushed', changed_at = SYSUTCDATETIME() "
+                "WHERE status IN ('done', 'undone') AND combo_id IN (SELECT v FROM OPENJSON(:c) WITH (v INT '$'))")
+                .bindparams(bindparam("c", type_=JSON_LIST)), {"c": chunk}).rowcount
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -5433,6 +5654,8 @@ def log_action(engine, actor: str, combo_id: int, label: str, description: str, 
             {"a": actor, "c": combo_id, "l": label, "d": description,
              "b": json.dumps(before, default=str), "f": json.dumps(after, default=str), "k": click_id},
         )
+        log_activity(conn, actor, "Department Review", description, label, conn.execute(text(
+            "SELECT n_upcs_total FROM dbo.dept_mapping_combos WHERE combo_id = :c"), {"c": combo_id}).scalar(), combo_id)
         conn.execute(
             text(
                 f"DELETE FROM dbo.dept_mapping_action_log WHERE actor = :a AND action_id NOT IN ("
@@ -5548,6 +5771,8 @@ def _step(engine, actor: str, undo: bool) -> dict:
         _apply_state(conn, row["combo_id"], target, current, actor)
         conn.execute(text("UPDATE dbo.dept_mapping_action_log SET status = :s, changed_at = SYSUTCDATETIME() "
                           "WHERE action_id = :i"), {"s": "undone" if undo else "done", "i": row["action_id"]})
+        log_activity(conn, actor, "Undo / Redo", f"{'Undid' if undo else 'Redid'}: {row['description']}", row["label"],
+                     None, row["combo_id"])
         _clear_dept_push_approvals(conn)
     return {"ok": True, "entry": entry}
 
@@ -5955,3 +6180,406 @@ def _safe(fn, *args):
         fn(*args)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Where a staged or decided change came from — for Pending Changes / Decided.
+# ---------------------------------------------------------------------------
+def group_facts(engine) -> dict:
+    """{combo_id: {...}} — where each group sits now (Crosswalk / Unmatched /
+    Broken Out / Decided), what it was decided as before, and the
+    distributor's own text for it."""
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT combo_id, source_key, raw_department, raw_category, raw_subcategory, tier, n_evidence, decision_state, "
+            "decided_department, manual_department, decided_via, suggested_department, n_upcs_total, last_decided_by, "
+            "decided_note FROM dbo.dept_mapping_combos")).mappings().all()
+    out = {}
+    for r in rows:
+        r = dict(r)
+        state = r["decision_state"]
+        if state == "broken_out":
+            where = "Broken Out"
+        elif state in ("decided", "decided_broken_out") or r["decided_department"]:
+            where = "Decided"
+        else:
+            where = "Unmatched" if origin_tier(r["tier"], r["n_evidence"]) == "unmatched" else "Crosswalk"
+        r["where"] = where
+        r["queue"] = "Unmatched" if origin_tier(r["tier"], r["n_evidence"]) == "unmatched" else "Crosswalk"
+        out[r["combo_id"]] = r
+    return out
+
+
+def pending_overrides_by_group(engine) -> pd.DataFrame:
+    """Staged UPC overrides (Pending Changes tab), one row per item with the
+    group it sits in, for listing them by group."""
+    with engine.connect() as conn:
+        return pd.read_sql(text(
+            "SELECT p.upc, cu.combo_id, p.description, i.department AS now, p.department, p.origin_note, "
+            "p.staged_by, p.staged_at FROM dbo.item_master_pending_changes p "
+            "JOIN dbo.dept_mapping_combo_upcs cu ON cu.upc = p.upc LEFT JOIN dbo.items i ON i.upc = p.upc "
+            "WHERE p.change_type = 'edit'"), conn)
+
+
+def get_combo_member_items_bulk(engine, combo_ids: list) -> pd.DataFrame:
+    """get_combo_member_items for many groups in ONE query (combo_id column added)."""
+    ids = [int(c) for c in combo_ids]
+    if not ids:
+        return pd.DataFrame(columns=["combo_id", "upc", "description", "brand", "pack", "size", "uom", "manually_edited_by"])
+    with engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                "SELECT cu.combo_id, i.upc, i.description, i.brand, i.pack, i.size, i.uom, mo.updated_by AS manually_edited_by "
+                "FROM dbo.dept_mapping_combo_upcs cu JOIN dbo.items i ON i.upc = cu.upc "
+                "LEFT JOIN dbo.manual_overrides mo ON mo.upc = i.upc "
+                "WHERE cu.combo_id IN (SELECT v FROM OPENJSON(:ids) WITH (v BIGINT '$')) ORDER BY i.description"
+            ),
+            conn, params={"ids": json.dumps(ids)},
+        )
+
+
+def groups_for_upcs(engine, upcs: list) -> dict:
+    """{upc: combo_id} for the given UPCs."""
+    with engine.connect() as conn:
+        df = _in_chunks(conn, "SELECT upc, combo_id FROM dbo.dept_mapping_combo_upcs WHERE upc IN (SELECT v FROM OPENJSON(:u) WITH (v VARCHAR(400) '$'))", upcs)
+    return dict(zip(df["upc"], df["combo_id"])) if not df.empty else {}
+
+
+def noted_item_counts(engine) -> dict:
+    """{combo_id: {note: n}} — item decisions carrying a note (e.g. from the old-workbook import)."""
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT combo_id, decided_note, COUNT(*) FROM dbo.dept_mapping_upc_overrides "
+            "WHERE decided_note IS NOT NULL GROUP BY combo_id, decided_note")).all()
+    out = {}
+    for cid, note, n in rows:
+        out.setdefault(cid, {})[note] = n
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Undo a whole one-time old-workbook import (see old_workbook_import).
+# ---------------------------------------------------------------------------
+IMPORT_NOTE_LIKE = "📥 One-time old-workbook import%"
+
+
+def old_workbook_import_summary(engine) -> dict:
+    """What the import currently has staged or moved (still undoable)."""
+    with engine.connect() as conn:
+        q = lambda sql: conn.execute(text(sql), {"n": IMPORT_NOTE_LIKE}).scalar() or 0
+        return {
+            "groups": q("SELECT COUNT(*) FROM dbo.dept_mapping_pending_changes WHERE origin_note LIKE :n"),
+            "items": q("SELECT COUNT(*) FROM dbo.dept_mapping_pending_upc_changes WHERE origin_note LIKE :n"),
+            "overrides": q("SELECT COUNT(*) FROM dbo.item_master_pending_changes WHERE origin_note LIKE :n"),
+            "moves": q("SELECT COUNT(DISTINCT combo_id) FROM dbo.dept_mapping_recent_moves WHERE origin_note LIKE :n"),
+        }
+
+
+def set_pending_note(engine, combo_id: int, note: str | None) -> None:
+    """Where a staged group decision came from (shown on its card)."""
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE dbo.dept_mapping_pending_changes SET origin_note = :n WHERE combo_id = :c"),
+                     {"n": note, "c": combo_id})
+
+
+def list_import_choices(engine, status: str | None = "open") -> list:
+    """A workbook upload's "which is right?" questions (see old_workbook_import._choices)."""
+    sql = "SELECT * FROM dbo.import_choices" + (" WHERE status = :s" if status else "") + " ORDER BY choice_id"
+    with engine.connect() as conn:
+        return [dict(r) for r in conn.execute(text(sql), {"s": status} if status else {}).mappings().all()]
+
+
+def import_notes(engine) -> dict:
+    """{combo_id: note text} — groups the workbook listed more than once where only one row decided anything."""
+    with engine.connect() as conn:
+        return {r[0]: r[1] for r in conn.execute(text(
+            "SELECT combo_id, workbook_says FROM dbo.import_choices WHERE status = 'note'")).all()}
+
+
+def close_import_choice(engine, choice_id: int, status: str, actor: str, picked: str = None) -> None:
+    """status: 'kept' (what was in effect stays) or 'switched' (another option was taken); picked: that option."""
+    with engine.begin() as conn:
+        if picked:
+            conn.execute(text("UPDATE dbo.import_choices SET alternative = :p WHERE choice_id = :i"), {"p": picked, "i": choice_id})
+        r = conn.execute(text("SELECT label, applied, alternative FROM dbo.import_choices WHERE choice_id = :i"),
+                         {"i": choice_id}).mappings().first()
+        conn.execute(text("UPDATE dbo.import_choices SET status = :s, decided_by = :a, decided_at = SYSUTCDATETIME() "
+                          "WHERE choice_id = :i"), {"s": status, "a": actor, "i": choice_id})
+        if r:
+            log_activity(conn, actor, "Department Review",
+                         "Workbook vs app — chose: " + (r["alternative"] or r["applied"] or ""), r["label"],
+                         via="Department workbook upload")
+
+
+def reopen_import_choice(engine, choice_id: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE dbo.import_choices SET status = 'open', decided_by = NULL, decided_at = NULL "
+                          "WHERE choice_id = :i"), {"i": choice_id})
+
+
+def undo_old_workbook_import(engine, actor: str) -> dict:
+    """Takes back everything the import staged and undoes the moves it made —
+    and nothing anyone else did: a group someone else has since voted on or
+    staged on is left as it is (and reported), and a move is only undone
+    while it's still the group's latest step. Its top-bar Undo steps are
+    cleared too. Returns counts, plus what was left alone and why."""
+    done = {"groups": 0, "items": 0, "overrides": 0, "moves": 0, "kept": []}
+    with engine.begin() as conn:
+        n = {"n": IMPORT_NOTE_LIKE}
+        conn.execute(text("DELETE FROM dbo.import_choices"))  # the import's questions go with it
+        labels = _combo_labels(conn, [r[0] for r in conn.execute(text(
+            "SELECT combo_id FROM dbo.dept_mapping_pending_changes WHERE origin_note LIKE :n "
+            "UNION SELECT combo_id FROM dbo.dept_mapping_recent_moves WHERE origin_note LIKE :n"), n).all()])
+        name = lambda cid: labels[cid][0] if cid in labels else f"group {cid}"
+        # 1. staged group decisions (and the importer's own vote on them)
+        for cid, stager in conn.execute(text(
+                "SELECT combo_id, staged_by FROM dbo.dept_mapping_pending_changes WHERE origin_note LIKE :n"), n).all():
+            others = conn.execute(text("SELECT COUNT(*) FROM dbo.dept_mapping_combo_suggestions "
+                                       "WHERE combo_id = :c AND staged_by <> :s"), {"c": cid, "s": stager}).scalar()
+            if others:
+                done["kept"].append(f"{name(cid)}: others have voted on it since")
+                continue
+            conn.execute(text("DELETE FROM dbo.dept_mapping_pending_changes WHERE combo_id = :c"), {"c": cid})
+            conn.execute(text("DELETE FROM dbo.dept_mapping_combo_suggestions WHERE combo_id = :c"), {"c": cid})
+            conn.execute(text("DELETE FROM dbo.dept_mapping_undo_requests WHERE entity_type = 'combo' AND entity_id = :c"),
+                         {"c": str(cid)})
+            done["groups"] += 1
+        # 2. staged Broken Out item decisions and 3. staged UPC overrides
+        done["items"] = conn.execute(text(
+            "DELETE FROM dbo.dept_mapping_pending_upc_changes WHERE origin_note LIKE :n"), n).rowcount
+        done["overrides"] = conn.execute(text(
+            "DELETE FROM dbo.item_master_pending_changes WHERE origin_note LIKE :n"), n).rowcount
+        # 4. its moves — only while they're still the group's latest steps
+        moved = {}
+        for mid, cid, note, snap in conn.execute(text(
+                "SELECT move_id, combo_id, origin_note, snapshot_json FROM dbo.dept_mapping_recent_moves "
+                "ORDER BY move_id DESC")).all():
+            moved.setdefault(cid, []).append((mid, note, snap))
+        for cid, stack in moved.items():
+            ours = [m for m in stack if m[1] and m[1].startswith(IMPORT_NOTE_LIKE[:-1])]
+            if not ours:
+                continue
+            if stack[0][1] is None or not stack[0][1].startswith(IMPORT_NOTE_LIKE[:-1]):
+                done["kept"].append(f"{name(cid)}: moved again since the import")
+                continue
+            busy = conn.execute(text(
+                "SELECT (SELECT COUNT(*) FROM dbo.dept_mapping_pending_changes WHERE combo_id = :c) + "
+                "(SELECT COUNT(*) FROM dbo.dept_mapping_pending_upc_changes WHERE combo_id = :c) + "
+                "(SELECT COUNT(*) FROM dbo.dept_mapping_combo_suggestions WHERE combo_id = :c)"), {"c": cid}).scalar()
+            if busy:
+                done["kept"].append(f"{name(cid)}: someone has staged work on it since")
+                continue
+            _lock_combo(conn, cid)
+            _restore_combo_snapshot(conn, cid, json.loads(ours[-1][2]), actor)
+            conn.execute(text("DELETE FROM dbo.dept_mapping_recent_moves WHERE move_id IN :ids")
+                         .bindparams(bindparam("ids", expanding=True)), {"ids": [m[0] for m in ours]})
+            done["moves"] += 1
+        # its top-bar Undo steps no longer apply
+        conn.execute(text("DELETE FROM dbo.dept_mapping_action_log WHERE click_id LIKE 'oldwb-%'"))
+        _clear_dept_push_approvals(conn)
+    return done
+
+
+# ---------------------------------------------------------------------------
+# Settings requests: editors can't change Department Review settings, but can
+# ask an admin to — add a Department, add a Strict Department, or set (or
+# remove) an Unmatched Department Default. An admin approves (the change is
+# made) or denies, with a note; either can be undone back to "waiting".
+# ---------------------------------------------------------------------------
+SETTINGS_REQUEST_KINDS = {
+    "add_department": "Add a Department",
+    "add_strict": "Add a Strict Department",
+    "unmatched_default": "Set an Unmatched Department Default",
+}
+_SETTINGS_REQUESTS_DDL = """
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'dept_settings_requests')
+BEGIN
+    CREATE TABLE dbo.dept_settings_requests (
+        request_id    INT IDENTITY(1,1) NOT NULL,
+        kind          VARCHAR(30) NOT NULL,
+        payload       NVARCHAR(MAX) NOT NULL,
+        reason        NVARCHAR(1000) NULL,
+        requested_by  NVARCHAR(200) NOT NULL,
+        requested_at  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        status        VARCHAR(20) NOT NULL DEFAULT 'pending',
+        decided_by    NVARCHAR(200) NULL,
+        decided_at    DATETIME2 NULL,
+        admin_note    NVARCHAR(1000) NULL,
+        undo_json     NVARCHAR(MAX) NULL,
+        CONSTRAINT PK_dept_settings_requests PRIMARY KEY (request_id)
+    );
+END
+"""
+
+
+def ensure_settings_requests_table(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(_SETTINGS_REQUESTS_DDL))
+
+
+def describe_settings_request(kind: str, p: dict) -> str:
+    if kind == "add_department":
+        return f"Add Department **{p.get('department')}**"
+    src = "any source" if p.get("source_key") in (None, "", "any") else str(p["source_key"]).upper()
+    if kind == "add_strict":
+        return (f"Add Strict Department **{p.get('old_department')}** ({src})"
+                + (" — trust direct evidence" if p.get("trust_direct_evidence") else ""))
+    if not p.get("new_department"):
+        return f"Remove the Unmatched Default for **{p.get('old_department')}** ({src})"
+    return f"Unmatched Default: **{p.get('old_department')}** ({src}) → **{p.get('new_department')}**"
+
+
+def _settings_request_problem(conn, kind: str, p: dict) -> str | None:
+    """Why this can't be asked for / applied right now (None = fine)."""
+    if kind == "add_department":
+        d = (p.get("department") or "").strip().upper()
+        if not d:
+            return "Type the Department."
+        if conn.execute(text("SELECT 1 FROM dbo.dept_mapping_departments WHERE department = :d"), {"d": d}).first():
+            return f"{d} is already a Department."
+    elif kind == "add_strict":
+        if not (p.get("old_department") or "").strip():
+            return "Type the Department text exactly as the distributor's file has it."
+        if conn.execute(text("SELECT 1 FROM dbo.dept_mapping_strict_departments WHERE source_key = :s AND old_department = :o"),
+                        {"s": p.get("source_key") or "any", "o": p["old_department"].strip()}).first():
+            return "That's already a Strict Department."
+    elif kind == "unmatched_default":
+        if not (p.get("old_department") or "").strip():
+            return "Type the Department text exactly as the distributor's file has it."
+        cur = conn.execute(text("SELECT new_department FROM dbo.dept_mapping_unmatched_defaults WHERE source_key = :s "
+                                "AND old_department = :o"), {"s": p.get("source_key"), "o": p["old_department"].strip()}).scalar()
+        if (cur or None) == (p.get("new_department") or None):
+            return "That's already how it's set." if cur else "There's no default for that to remove."
+        if p.get("new_department") and not conn.execute(text("SELECT 1 FROM dbo.dept_mapping_departments WHERE department = :d"),
+                                                        {"d": p["new_department"]}).first():
+            return f"{p['new_department']} isn't a Department (request it first)."
+    else:
+        return "Unknown kind of request."
+    return None
+
+
+def create_settings_request(engine, kind: str, payload: dict, reason: str, actor: str) -> dict:
+    ensure_settings_requests_table(engine)
+    with engine.begin() as conn:
+        problem = _settings_request_problem(conn, kind, payload)
+        if problem:
+            return {"ok": False, "problem": problem}
+        dup = conn.execute(text("SELECT request_id FROM dbo.dept_settings_requests WHERE status = 'pending' AND kind = :k AND payload = :p"),
+                           {"k": kind, "p": json.dumps(payload, sort_keys=True)}).scalar()
+        if dup:
+            return {"ok": False, "problem": f"That's already been asked for (request #{dup}) and is waiting on an admin."}
+        rid = conn.execute(text(
+            "INSERT INTO dbo.dept_settings_requests (kind, payload, reason, requested_by) OUTPUT INSERTED.request_id "
+            "VALUES (:k, :p, :r, :a)"), {"k": kind, "p": json.dumps(payload, sort_keys=True), "r": reason or None, "a": actor}).scalar()
+        log_activity(conn, actor, "Settings", f"Requested: {describe_settings_request(kind, payload).replace('**', '')}",
+                     f"Request #{rid}", details={"reason": reason})
+    return {"ok": True, "request_id": rid}
+
+
+def list_settings_requests(engine, status: str | None = None, requested_by: str | None = None) -> list:
+    try:
+        with engine.connect() as conn:
+            sql = "SELECT * FROM dbo.dept_settings_requests WHERE 1 = 1"
+            params = {}
+            if status:
+                sql += " AND status = :st"; params["st"] = status
+            if requested_by:
+                sql += " AND requested_by = :a"; params["a"] = requested_by
+            rows = [dict(r) for r in conn.execute(text(sql + " ORDER BY request_id DESC"), params).mappings().all()]
+    except Exception:
+        return []
+    for r in rows:
+        r["payload"] = json.loads(r["payload"])
+        r["summary"] = describe_settings_request(r["kind"], r["payload"])
+    return rows
+
+
+def withdraw_settings_request(engine, request_id: int, actor: str) -> bool:
+    with engine.begin() as conn:
+        ok = conn.execute(text("UPDATE dbo.dept_settings_requests SET status = 'withdrawn', decided_by = :a, decided_at = SYSUTCDATETIME() "
+                               "WHERE request_id = :r AND requested_by = :a AND status = 'pending'"),
+                          {"r": request_id, "a": actor}).rowcount == 1
+        if ok:
+            log_activity(conn, actor, "Settings", "Withdrew a request", f"Request #{request_id}")
+        return ok
+
+
+def approve_settings_request(engine, request_id: int, admin: str, note: str | None = None) -> dict:
+    """Makes the change and records how to take it back. Returns
+    {"ok", "kind", "problem"}; a Strict Department or Unmatched Default
+    only matters once the Department engine re-runs (the caller does that)."""
+    with engine.begin() as conn:
+        r = conn.execute(text("SELECT * FROM dbo.dept_settings_requests WITH (UPDLOCK) WHERE request_id = :r"),
+                         {"r": request_id}).mappings().first()
+        if not r or r["status"] != "pending":
+            return {"ok": False, "problem": "This request isn't waiting any more (someone already handled it)."}
+        kind, p = r["kind"], json.loads(r["payload"])
+        problem = _settings_request_problem(conn, kind, p)
+        if problem:
+            return {"ok": False, "problem": problem}
+        undo = {}
+        if kind == "add_department":
+            d = p["department"].strip().upper()
+            conn.execute(text("INSERT INTO dbo.dept_mapping_departments (department, source_type) VALUES (:d, 'manual')"), {"d": d})
+            undo = {"remove_department": d}
+        elif kind == "add_strict":
+            conn.execute(text("INSERT INTO dbo.dept_mapping_strict_departments (source_key, old_department, trust_direct_evidence, updated_by) "
+                              "VALUES (:s, :o, :t, :a)"), {"s": p.get("source_key") or "any", "o": p["old_department"].strip(),
+                                                           "t": bool(p.get("trust_direct_evidence")), "a": admin})
+            undo = {"remove_strict": [p.get("source_key") or "any", p["old_department"].strip()]}
+        else:
+            s_, o = p.get("source_key"), p["old_department"].strip()
+            prev = conn.execute(text("SELECT new_department FROM dbo.dept_mapping_unmatched_defaults WHERE source_key = :s "
+                                     "AND old_department = :o"), {"s": s_, "o": o}).scalar()
+            conn.execute(text("DELETE FROM dbo.dept_mapping_unmatched_defaults WHERE source_key = :s AND old_department = :o"),
+                         {"s": s_, "o": o})
+            if p.get("new_department"):
+                conn.execute(text("INSERT INTO dbo.dept_mapping_unmatched_defaults (source_key, old_department, new_department, updated_by) "
+                                  "VALUES (:s, :o, :n, :a)"), {"s": s_, "o": o, "n": p["new_department"], "a": admin})
+            undo = {"restore_default": [s_, o, prev]}
+        conn.execute(text("UPDATE dbo.dept_settings_requests SET status = 'approved', decided_by = :a, decided_at = SYSUTCDATETIME(), "
+                          "admin_note = :n, undo_json = :u WHERE request_id = :r"),
+                     {"a": admin, "n": note or None, "u": json.dumps(undo), "r": request_id})
+        log_activity(conn, admin, "Settings", f"Approved: {describe_settings_request(kind, p).replace('**', '')}",
+                     f"Request #{request_id} from {r['requested_by']}")
+    return {"ok": True, "kind": kind}
+
+
+def deny_settings_request(engine, request_id: int, admin: str, note: str | None = None) -> bool:
+    with engine.begin() as conn:
+        ok = conn.execute(text("UPDATE dbo.dept_settings_requests SET status = 'denied', decided_by = :a, decided_at = SYSUTCDATETIME(), "
+                               "admin_note = :n WHERE request_id = :r AND status = 'pending'"),
+                          {"a": admin, "n": note or None, "r": request_id}).rowcount == 1
+        if ok:
+            log_activity(conn, admin, "Settings", "Denied a request" + (f" — “{note}”" if note else ""), f"Request #{request_id}")
+        return ok
+
+
+def undo_settings_request_decision(engine, request_id: int, admin: str) -> dict:
+    """Back to waiting: a denial is simply reopened; an approval's change is
+    taken back first (the Department / Strict Department removed, the
+    Unmatched Default put back as it was)."""
+    with engine.begin() as conn:
+        r = conn.execute(text("SELECT * FROM dbo.dept_settings_requests WITH (UPDLOCK) WHERE request_id = :r"),
+                         {"r": request_id}).mappings().first()
+        if not r or r["status"] not in ("approved", "denied"):
+            return {"ok": False, "problem": "Only an approved or denied request can be undone."}
+        undo = json.loads(r["undo_json"] or "{}") if r["status"] == "approved" else {}
+        if "remove_department" in undo:
+            conn.execute(text("DELETE FROM dbo.dept_mapping_departments WHERE department = :d AND source_type = 'manual'"),
+                         {"d": undo["remove_department"]})
+        if "remove_strict" in undo:
+            conn.execute(text("DELETE FROM dbo.dept_mapping_strict_departments WHERE source_key = :s AND old_department = :o"),
+                         {"s": undo["remove_strict"][0], "o": undo["remove_strict"][1]})
+        if "restore_default" in undo:
+            s_, o, prev = undo["restore_default"]
+            conn.execute(text("DELETE FROM dbo.dept_mapping_unmatched_defaults WHERE source_key = :s AND old_department = :o"),
+                         {"s": s_, "o": o})
+            if prev:
+                conn.execute(text("INSERT INTO dbo.dept_mapping_unmatched_defaults (source_key, old_department, new_department, updated_by) "
+                                  "VALUES (:s, :o, :n, :a)"), {"s": s_, "o": o, "n": prev, "a": admin})
+        conn.execute(text("UPDATE dbo.dept_settings_requests SET status = 'pending', decided_by = NULL, decided_at = NULL, "
+                          "admin_note = NULL, undo_json = NULL WHERE request_id = :r"), {"r": request_id})
+        log_activity(conn, admin, "Settings", "Undid the approval of a request" if r["status"] == "approved"
+                     else "Undid the denial of a request", f"Request #{request_id}")
+    return {"ok": True, "kind": r["kind"], "was": r["status"]}

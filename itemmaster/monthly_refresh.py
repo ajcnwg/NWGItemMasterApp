@@ -108,8 +108,10 @@ class _PathFile:
 def ingest_checked(engine, rep: dict, actor: str) -> None:
     """Saves a file checked by check_file: replaces the source's raw rows,
     logs the upload, and keeps the as-read file for later re-runs."""
-    stage_source(engine, rep["source_key"], rep["_cleaned"], rep["_rejected"], rep["stats"],
-                 uploaded_by=actor, original_filename=rep["file"])
+    from itemmaster.dept_mapping import activity_via
+    with activity_via("Monthly refresh"):
+        stage_source(engine, rep["source_key"], rep["_cleaned"], rep["_rejected"], rep["stats"],
+                     uploaded_by=actor, original_filename=rep["file"])
     save_raw_upload(engine, rep["source_key"], rep["_raw"], rep["file"], actor)
     rep["status"] = "ingested"
 

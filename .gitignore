@@ -32,3 +32,13 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# test runs
+tests/logs/
+tests/output/
+tests/data/
+tests/import_snap.txt
+tests/*.xlsx
+tests/*.pkl
+tests/*.csv
+tests/__pycache__/

@@ -263,7 +263,9 @@ admin.
 
 ```
 ItemMasterApp/
-├── app.py                    the app itself — run this with Streamlit
+├── app.py                    the app itself — run this with Streamlit (a contents map is at the top;
+│                             each tab is one render_*_tab function, picked by the router at the end)
+├── assets/                   the app's styles (loading screen, tab look)
 ├── itemmaster/               the app's code
 │   ├── db.py                 database connection (waits out a waking database)
 │   ├── dept_mapping.py       Department Review engine, staging, undo, snapshots, merge
@@ -271,12 +273,15 @@ ItemMasterApp/
 │   ├── autodetect.py         guessing which column is which in a new file
 │   ├── item_bulk.py          bulk add / delete / change uploads
 │   ├── monthly_refresh.py    the monthly refresh (in the app and the script)
-│   └── old_workbook_import.py  admin import of an old department workbook
+│   └── old_workbook_import.py  the Excel department workbook: download the app as one, upload it back
 ├── migrations/
 │   └── 001_create_schema.py  the complete database schema, in one file
 ├── scripts/                  command-line tools (monthly refresh, passwords, reset, seeding)
-├── Inputs/                   the distributor source files
-├── .streamlit/config.toml    hides Streamlit's developer toolbar and error details
+├── tests/                    end-to-end tests of the whole app — see tests/README.md
+│                             (`python tests/run_tests.py`; the old-workbook tests need
+│                             tests/data/old department workbook V2.xlsx, which isn't in git)
+├── Inputs/                   the distributor source files (not in git)
+├── .streamlit/config.toml    hides Streamlit's developer toolbar and error details; reloads code on save
 ├── config.example.yaml       login accounts template (copy to config.yaml)
 ├── .env.example              database connection template (copy to .env)
 └── requirements.txt

@@ -459,6 +459,10 @@ def stage_source(engine, source_key: str, cleaned_df: pd.DataFrame, rejected_df:
             to_insert = to_insert.replace({"": None})
             to_insert.to_sql("ingestion_rejected_rows", conn, schema="dbo", if_exists="append", index=False, chunksize=1000)
 
+    from itemmaster.dept_mapping import log_activity  # (here: dept_mapping imports this module's neighbours)
+    log_activity(engine, uploaded_by, "Uploads & Merge", f"Uploaded {original_filename or 'a file'}", source_key,
+                 int(stats.get("rows_staged") or len(cleaned_df)),
+                 details={k: stats.get(k) for k in ("rows_parsed", "rows_staged", "dropped_invalid_upc", "dropped_duplicate_upc")})
     return log_id
 
 
@@ -503,16 +507,3 @@ def load_raw_upload(engine, source_key: str):
     }
 
 
-def list_raw_upload_meta(engine) -> dict:
-    """{source_key: {filename, uploaded_by, uploaded_at}} for every source
-    with a stored last-upload — cheap (no raw_csv column) metadata for
-    rendering a "Re-run" list; load_raw_upload pulls the actual data only
-    once a specific source's Re-run is clicked."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT source_key, filename, uploaded_by, uploaded_at FROM dbo.source_raw_uploads")
-        ).mappings().all()
-    return {
-        r["source_key"]: {"filename": r["filename"], "uploaded_by": r["uploaded_by"], "uploaded_at": r["uploaded_at"]}
-        for r in rows
-    }

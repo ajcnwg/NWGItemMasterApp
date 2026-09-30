@@ -1,0 +1,189 @@
+/* Loading, two ways.
+   - Everyday clicks (a page or card redrawing): no screen at all. Whatever
+     is still being redrawn after ~0.35s turns into a shimmering skeleton
+     block in place, so quick clicks show nothing.
+   - Big work (a push, merge, restore, snapshot, import, undo — anything
+     that shows its own st.spinner message): a dimmed, blurred layer covers
+     the page with a centered card saying what's happening, and takes the
+     clicks so nobody clicks something else mid-way. */
+/* One loading screen only: Streamlit's own "Running load_x(...)"
+   lines, its running/Stop corner and Deploy button stay hidden, and the
+   page doesn't fade while it redraws — the centered box says it all.
+   The lock and box below key off Streamlit marking the app as running. */
+[data-testid="stStatusWidget"] { visibility: hidden !important; }
+[data-testid="stAppDeployButton"] { display: none !important; }
+[data-stale="true"], .stale-element { opacity: 1 !important; filter: none !important; transition: none !important; }
+div[data-testid="stSpinner"]:has(code) { display: none !important; }
+/* The app's own "what I'm doing" messages (st.spinner) move into the
+   loading card instead of sitting behind the veil. */
+[data-test-script-state="running"] div[data-testid="stSpinner"] {
+    position: fixed !important;
+    top: calc(42% + 3.6rem);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000300;
+    width: min(30rem, 86vw);
+    text-align: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 0.85rem;
+    animation: app-fade-in 0.2s ease-out 0.3s both;
+}
+[data-test-script-state="running"] div[data-testid="stSpinner"] i,
+[data-test-script-state="running"] div[data-testid="stSpinner"] svg { display: none !important; }
+/* Content arriving while a page builds (group cards load in one after
+   another) fades in instead of popping into place. Only on first
+   appearance — anything already on screen isn't re-animated. Cards
+   (bordered boxes) also rise a few pixels; plain elements only fade,
+   since a moving parent would drag the fixed top bar along with it. */
+@keyframes app-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes app-card-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+[data-testid="stMain"] div[data-testid="stElementContainer"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])),
+[data-testid="stMain"] div[data-app-card="1"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
+    animation: app-fade-in 0.25s ease-out backwards;
+}
+@media (prefers-reduced-motion: reduce) {
+    [data-testid="stMain"] * { animation: none !important; }
+}
+.app-busy-lock {
+    position: fixed;
+    inset: 0;
+    z-index: 1000100;
+    cursor: progress;
+    background: rgba(0, 0, 0, 0);
+    visibility: hidden;
+    transition: visibility 0s linear 0s, background 0.1s;
+}
+body:not(:has([data-testid="stDialog"] [data-testid="stSpinner"])) [data-test-script-state="running"]:has(div[data-testid="stSpinner"]) .app-busy-lock {
+    visibility: visible;
+    background: rgba(14, 17, 23, 0.6);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    transition: visibility 0s linear 0.3s, background 0.25s ease-in 0.3s;
+}
+/* Centered "Working…" box, shown together with the click lock so the
+   grey screen always says why. */
+.app-loading-overlay {
+    position: fixed;
+    top: 42%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 1000200;
+    background: rgba(22, 26, 34, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    padding: 1.4rem 2.2rem 1.2rem;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.85rem;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease-out, transform 0.12s ease-out;
+}
+body:not(:has([data-testid="stDialog"] [data-testid="stSpinner"])) [data-test-script-state="running"]:has(div[data-testid="stSpinner"]) .app-loading-overlay {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    transition: opacity 0.2s ease-in 0.3s;
+}
+/* An operation with its own real st.progress() bar (Compute/Push Merge)
+   renders this marker for its whole duration — the corner chip would
+   otherwise still kick in after ~1s (it reacts to ANY running script,
+   not to how long-running it turns out to be) and sit there redundant
+   with the actual progress bar's own status text. */
+body:has(.own-progress-marker) .app-loading-overlay {
+    opacity: 0 !important;
+}
+.app-loading-spinner {
+    width: 2.1rem;
+    height: 2.1rem;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.12);
+    border-top-color: #ff4b4b;
+    animation: app-loading-spin 0.8s linear infinite;
+}
+@keyframes app-loading-spin {
+    to { transform: rotate(360deg); }
+}
+.app-loading-text {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 0.9rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+}
+
+/* Skeletons: one per card.
+   While a page is being rebuilt, any card (a bordered box: a group, a move,
+   a question) that still has something waiting to be redrawn is covered by a
+   single solid placeholder card: a title bar, two lines and a button block,
+   with a soft light sweeping across. Nothing underneath shows through. The
+   whole card appears at once when it is ready. Loose pieces outside cards
+   (headings, captions) just dim while they wait. At the bottom, two
+   placeholder cards mark where more is still arriving. Everything waits
+   ~0.35s, so quick clicks never flash. */
+@keyframes app-skel-in { from { opacity: 0; } to { opacity: 1; } }
+body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]):not(:has(.app-busy-lock, [data-testid="stSpinner"]))::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    border-radius: inherit;
+    pointer-events: none;
+    background-color: rgb(17, 20, 27);
+    background-image:
+        linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.045) 50%, transparent 70%),
+        linear-gradient(rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.075)),
+        linear-gradient(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.055)),
+        linear-gradient(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.04)),
+        linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06));
+    background-size: 60% 100%, 36% 13px, 22% 11px, 48% 9px, 24% 30px;
+    background-position: -140% 0, 18px 18px, 18px 42px, 18px 64px, right 18px top 16px;
+    background-repeat: no-repeat;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+    animation: app-skel-in 0.18s ease-out 0.35s backwards, app-shimmer 1.6s ease-in-out 0.35s infinite;
+}
+body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]):not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
+    position: relative;
+    overflow: hidden;
+}
+/* the sweep moves only the first layer; the bars stay put */
+@keyframes app-shimmer {
+    from { background-position: -140% 0, 18px 18px, 18px 42px, 18px 64px, right 18px top 16px; }
+    to   { background-position: 240% 0, 18px 18px, 18px 42px, 18px 64px, right 18px top 16px; }
+}
+/* loose pieces outside cards: dim while they wait */
+body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-testid="stElementContainer"][data-stale="true"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
+    opacity: 0.35 !important;
+    transition: opacity 0.2s ease 0.35s !important;
+}
+/* where more is still arriving */
+body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMainBlockContainer"]::after {
+    content: "";
+    display: block;
+    height: 200px;
+    margin-top: 1rem;
+    pointer-events: none;
+    background-image:
+        linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.045) 50%, transparent 70%),
+        linear-gradient(rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.075)),
+        linear-gradient(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.055)),
+        linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06)),
+        linear-gradient(rgb(17, 20, 27), rgb(17, 20, 27)),
+        linear-gradient(rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.075)),
+        linear-gradient(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.055)),
+        linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06)),
+        linear-gradient(rgb(17, 20, 27), rgb(17, 20, 27));
+    background-size: 60% 100%, 36% 13px, 22% 11px, 24% 30px, 100% 88px, 36% 13px, 22% 11px, 24% 30px, 100% 88px;
+    background-position: -140% 0, 18px 18px, 18px 42px, right 18px top 16px, 0 0,
+                         18px 118px, 18px 142px, right 18px top 116px, 0 100px;
+    background-repeat: no-repeat;
+    border-radius: 0.5rem;
+    -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
+    mask-image: linear-gradient(to bottom, #000 55%, transparent);
+    animation: app-skel-in 0.2s ease-out 0.35s backwards, app-shimmer-tail 1.6s ease-in-out 0.35s infinite;
+}
+@keyframes app-shimmer-tail {
+    from { background-position: -140% 0, 18px 18px, 18px 42px, right 18px top 16px, 0 0, 18px 118px, 18px 142px, right 18px top 116px, 0 100px; }
+    to   { background-position: 240% 0, 18px 18px, 18px 42px, right 18px top 16px, 0 0, 18px 118px, 18px 142px, right 18px top 116px, 0 100px; }
+}

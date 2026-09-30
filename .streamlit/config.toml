@@ -7,3 +7,8 @@ showErrorDetails = "none"
 # The app never uses "magic" (bare expressions auto-displayed); turning it off
 # saves Streamlit re-parsing all of app.py on every run.
 magicEnabled = false
+
+[server]
+# Code changes are picked up on the next click (reloads changed code files too).
+# Makes no difference once hosted, where the files do not change.
+runOnSave = true
