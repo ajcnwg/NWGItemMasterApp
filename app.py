@@ -62,15 +62,58 @@ from itemmaster.autodetect import (
 )
 from itemmaster.db import get_engine, robust_begin, robust_connect
 from itemmaster.ingest import (
-    INVALID_UPC, REASON_EXPLANATIONS, SIZE_FORMATS, clean_upc, load_raw_upload, map_and_clean,
+    FileProblem,
+    INVALID_UPC, REASON_EXPLANATIONS, SIZE_FORMATS, clean_upc, invalid_upc_reason, load_raw_upload, map_and_clean,
     read_raw_file, save_raw_upload, stage_source,
 )
 from itemmaster import dept_mapping
 from itemmaster import item_bulk
 from itemmaster import monthly_refresh
 from itemmaster import old_workbook_import
+from itemmaster import upload_reports
+
+# APP_TIMING=1 prints how long each stage of every run took (off normally).
+_RUN_MARKS = [("start", time.perf_counter())]
+
+
+def _mark(name: str) -> None:
+    if os.environ.get("APP_TIMING"):
+        _RUN_MARKS.append((name, time.perf_counter()))
 
 st.set_page_config(page_title="NWG Item Master App", layout="wide")
+
+
+def grid_edited(key: str) -> bool:
+    """Whether a data_editor (by its key) has any edited, added or deleted rows."""
+    st_ = st.session_state.get(key) or {}
+    return bool(st_.get("edited_rows") or st_.get("added_rows") or st_.get("deleted_rows"))
+
+
+def blank_text(df: pd.DataFrame) -> pd.DataFrame:
+    """A table for showing: missing values in its text columns as blank cells
+    (the grid would otherwise print the word "None"). Number and date columns
+    are left as they are."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df
+    for c in df.columns:
+        col = df[c]
+        if (col.dtype == object or pd.api.types.is_string_dtype(col)) and col.isna().any():
+            vals = col.dropna()
+            if vals.map(lambda v: isinstance(v, str)).all():
+                if out is df:
+                    out = df.copy()
+                out[c] = col.astype(object).where(col.notna(), "")
+    return out
+
+
+if not getattr(st.dataframe, "_blank_text", False):
+    _st_dataframe = st.dataframe
+
+    def _dataframe_blank(data=None, *args, **kwargs):
+        return _st_dataframe(blank_text(data) if isinstance(data, pd.DataFrame) else data, *args, **kwargs)
+    _dataframe_blank._blank_text = True
+    st.dataframe = _dataframe_blank  # (every read-only table in the app)
 
 
 # ===========================================================================
@@ -99,11 +142,13 @@ def inject_css(name: str, html: str = "") -> None:
 def _error_card(icon: str, title: str, lines: list, ex: Exception, retry_label: str = "Try again") -> None:
     """One short, calm card instead of a wall of red text: what happened,
     what to do, a retry button. Admins can unfold the raw error."""
-    with st.container(border=True, key="friendly_error_card"):
+    n = st.session_state.get("_error_cards", 0) + 1
+    st.session_state["_error_cards"] = n
+    with st.container(border=True, key=f"friendly_error_card_{n}"):
         st.markdown(f"### {icon} {title}")
         for line in lines:
             st.markdown(line)
-        st.button(retry_label, key="_friendly_error_retry", type="primary")
+        st.button(retry_label, key=f"_friendly_error_retry_{n}", type="primary")
         if globals().get("is_admin"):
             with st.expander("Details (admin)"):
                 st.code(f"{type(ex).__name__}: {ex}"[:3000], language=None, wrap_lines=True)
@@ -173,17 +218,148 @@ inject_css("loading.css", html="""
 """)
 # Always drawn (only its class changes) so nothing below it shifts: after a
 # popup closes, that one rerun changes nothing on the page — no skeletons.
+_DEPT_DIALOG_SHOWN = False  # set once a Department Review popup is shown this run (see show_dept_dialog)
+_IN_DR_SECTION = False  # True while a Department Review section is being drawn (see popup_button)
 st.html(f'<div class="{"app-quiet-run" if st.session_state.pop("_quiet_run", False) else "app-run"}"></div>')
 # Bordered boxes (group cards, move cards, questions) carry no name CSS can
 # find, so they're tagged data-app-card as they appear — the skeleton (one
 # per card, in loading.css) keys off it.
 st.html("""<script>
+if (!window._appBell) {
+  // The bell opens the sidebar (where the notifications are), in the browser — no reload.
+  window._appBell = true;
+  document.addEventListener("click", e => {
+    if (!e.target.closest || !e.target.closest(".st-key-topbar_bell")) return;
+    const open = document.querySelector('[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"] button');
+    if (open) open.click();
+    const side = document.querySelector('[data-testid="stSidebarContent"]');
+    if (side) side.scrollTo({top: 0, behavior: "smooth"});
+  }, true);
+}
 if (!window._appCardTagger) {
   const tag = () => document.querySelectorAll('[data-testid="stMain"] [data-testid="stVerticalBlock"]:not([data-app-card])')
     .forEach(b => b.setAttribute("data-app-card", parseFloat(getComputedStyle(b).borderTopWidth) > 0 ? "1" : "0"));
   window._appCardTagger = new MutationObserver(tag);
   window._appCardTagger.observe(document.body, {childList: true, subtree: true});
   tag();
+  // "Show affected items" opens and closes at once, straight to the list's
+  // own size (its placeholder is drawn at that size), instead of Streamlit's
+  // height animation, which stutters while the page is busy.
+  document.addEventListener("click", e => {
+    const d = e.target.closest && e.target.closest("details");
+    if (!d || !e.target.closest("summary") || !d.querySelector('.app-aff-ph, [data-testid="stDataFrame"]')) return;
+    const finish = () => d.getAnimations().forEach(a => { try { a.finish(); } catch (_) {} });
+    requestAnimationFrame(finish);
+    setTimeout(finish, 30);
+  }, true);
+  // A click on a tab (or a Department Review section) marks the page as
+  // switching until that run finishes: loading.css then fades out the old
+  // tab's content below that bar instead of dimming it under the new one.
+  document.addEventListener("click", e => {
+    const bar = e.target.closest(".st-key-active_tab, .st-key-dept_review_subtab");
+    const label = e.target.closest("label");
+    if (!bar || !label || (label.querySelector("input") || {}).checked) return;
+    const body = document.body;
+    body.dataset.tabSwitch = bar.classList.contains("st-key-active_tab") ? "main" : "sub";
+    body.dataset.tabPhase = "wait";  // until the server starts the run: dim at once
+    let started = false;
+    const done = () => { delete body.dataset.tabSwitch; delete body.dataset.tabPhase; clearInterval(watch); };
+    const watch = setInterval(() => {
+      const app = document.querySelector("[data-test-script-state]");
+      const running = app && app.getAttribute("data-test-script-state") === "running";
+      if (running && !started) { started = true; body.dataset.tabPhase = "run"; }
+      if (started && !running) done();
+    }, 30);
+    setTimeout(() => { if (!started) done(); }, 2000);
+  }, true);
+  // A shortcut to a group ("Open group →"): it opens another tab, after two
+  // runs (its own part of the page, then the whole page) — so the page is
+  // marked as switching tabs until Department Review has been drawn: the old
+  // tab's content goes at once, placeholder cards show, and the button says so.
+  document.addEventListener("click", e => {
+    const b = e.target.closest('[class*="st-key-needs_dec_"] button');
+    if (!b || b.disabled) return;
+    const lbl = b.querySelector("p") || b;
+    lbl.textContent = "Opening…";
+    const body = document.body;
+    const t0 = Date.now();
+    setTimeout(() => {  // (after the click has reached the server)
+      body.dataset.tabSwitch = "main";
+      body.dataset.tabPhase = "wait";
+      window.scrollTo({top: 0});
+      let idle = 0;
+      const watch = setInterval(() => {
+        const app = document.querySelector("[data-test-script-state]");
+        const running = app && app.getAttribute("data-test-script-state") === "running";
+        const there = new URL(window.location.href).searchParams.get("tab") === "Department Review";
+        idle = there && !running ? idle + 1 : 0;
+        if (idle >= 3 || Date.now() - t0 > 25000) {
+          delete body.dataset.tabSwitch; delete body.dataset.tabPhase; clearInterval(watch);
+        }
+      }, 50);
+    }, 0);
+  }, true);
+  // While the other sections catch up after an action, their tab buttons show
+  // a pulsing dot, and one opened before it's done is dimmed ("Updating…").
+  const drRoot = () => document.querySelector('[class*="st-key-dr_sections_"]');
+  const tabLabel = t => (t && t.innerText || "").trim();
+  const applyUpdating = () => {
+    const root = drRoot();
+    if (!root) return;
+    const c = window._drCatchUp;  // {fresh: the section the action was in} while catching up
+    const tabs = [...root.querySelectorAll('[role="tab"]')];
+    tabs.forEach(t => { if (c && tabLabel(t) !== c.fresh) t.dataset.updating = "1"; else delete t.dataset.updating; });
+    const sel = tabs.find(t => t.getAttribute("aria-selected") === "true");
+    const panel = root.querySelector('[role="tabpanel"]');  // (only the section showing is on the page)
+    if (panel) { if (c && tabLabel(sel) !== c.fresh) panel.dataset.updating = "1"; else delete panel.dataset.updating; }
+  };
+  const markUpdating = on => {
+    const root = drRoot();
+    const sel = root && [...root.querySelectorAll('[role="tab"]')].find(t => t.getAttribute("aria-selected") === "true");
+    window._drCatchUp = on ? {fresh: tabLabel(sel)} : null;
+    applyUpdating();
+  };
+  document.addEventListener("click", e => {
+    if (window._drCatchUp && e.target.closest('[class*="st-key-dr_sections_"] [role="tab"]')) setTimeout(applyUpdating, 0);
+  }, true);
+  // Department Review sections switch in the browser (no server trip), so
+  // the address's ?sub= is kept here, and re-applied after each page run.
+  const setSub = () => {
+    if (!window._drSub) return;
+    const u = new URL(window.location.href);
+    if (u.searchParams.get("tab") !== "Department Review" || u.searchParams.get("sub") === window._drSub) return;
+    u.searchParams.set("sub", window._drSub);
+    window.history.replaceState(null, "", u.toString());
+  };
+  document.addEventListener("click", e => {
+    const t = e.target.closest('[class*="st-key-dr_sections_"] [role="tab"]');
+    if (t) { window._drSub = t.innerText.trim(); setTimeout(setSub, 0); }
+  }, true);
+  new MutationObserver(() => {
+    const app = document.querySelector("[data-test-script-state]");
+    if (app && app.getAttribute("data-test-script-state") !== "running") {
+      setTimeout(setSub, 50);
+      // A section re-ran on its own after an action: bring the rest up to date.
+      setTimeout(() => {
+        const idle = app.getAttribute("data-test-script-state") !== "running";
+        const marker = document.querySelector('.app-catchup-needed');
+        const btn = document.querySelector('.st-key-dr_catch_up_btn button');
+        if (idle && marker && btn && !marker.dataset.pressed) {
+          marker.dataset.pressed = "1";
+          markUpdating(true);
+          btn.click();
+          let started = false;
+          const watch = setInterval(() => {
+            const running = app.getAttribute("data-test-script-state") === "running";
+            if (running) started = true;
+            if (started && !running) { markUpdating(false); clearInterval(watch); }
+            else applyUpdating();
+          }, 40);
+          setTimeout(() => { markUpdating(false); clearInterval(watch); }, 20000);
+        }
+      }, 60);
+    }
+  }).observe(document.body, {attributes: true, subtree: true, attributeFilter: ["data-test-script-state"]});
 }
 </script>""", unsafe_allow_javascript=True)
 
@@ -210,8 +386,10 @@ def _shared_engine():
 
 
 ENGINE = _shared_engine()
+_mark("engine")
 
 authenticator.login(location="main")
+_mark("login")
 
 auth_status = st.session_state.get("authentication_status")
 if not auth_status:
@@ -433,10 +611,11 @@ def row_changed(edited_row, original_row, columns) -> bool:
     Category, Subcategory, or Brand). Comparing scalar-by-scalar and
     treating any two "missing" values as equal, regardless of whether
     one is None and the other NaN, avoids this false positive."""
+    blank = lambda v: v is None or (not isinstance(v, str) and pd.isna(v)) or (isinstance(v, str) and v == "")
     for col in columns:
         a, b = edited_row[col], original_row[col]
-        if pd.isna(a) and pd.isna(b):
-            continue
+        if blank(a) and blank(b):
+            continue  # (a cell shown blank and left blank is no change)
         if a != b:
             return True
     return False
@@ -506,6 +685,21 @@ def diff_pending_fields(old: dict, new: dict, fields: list, labels: dict) -> lis
     return diffs
 
 
+def fmt_when(ts) -> str:
+    """A stored UTC timestamp as people read it: "09/30 21:32 UTC"."""
+    t = pd.to_datetime(ts, errors="coerce")
+    return t.strftime("%m/%d %H:%M UTC") if pd.notna(t) else "?"
+
+
+def diffs_inline(diffs: list, most: int = 3) -> str:
+    """ "Category: BAGELS → BAGELS TEST · Brand: …" for a card (up to `most`
+    fields; the rest are counted)."""
+    cut = lambda v: re.sub(r"([\\`*_\[\]$~#<>|])", r"\\\1", v if len(v) <= 40 else v[:39] + "…")
+    shown = [f"{label}: {cut(old)} → **{cut(new)}**" for label, old, new in diffs[:most]]
+    more = len(diffs) - most
+    return " · ".join(shown) + (f" · and {more} more" if more > 0 else "")
+
+
 def render_pending_field_table(rows: list, columns: list) -> None:
     if rows:
         st.dataframe(pd.DataFrame(rows, columns=columns), hide_index=True, width='stretch')
@@ -526,11 +720,46 @@ def mark_own_progress() -> None:
 # Loaders: items, sources, merge status, snapshots
 # ===========================================================================
 
-@st.cache_data(show_spinner=False)
-def load_items() -> pd.DataFrame:
+@st.cache_data(ttl=30, show_spinner=False)
+def _items_fingerprint() -> tuple:
+    """Whether the item master changed — checked at most every 30 s, so a
+    change made outside this app (the monthly script's push, another app
+    server) shows up here too, not only changes made in this app."""
+    with db_connect_cached() as conn:
+        return tuple(conn.execute(text(dept_mapping.ITEMS_FINGERPRINT_SQL)).one())
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def _load_items(fingerprint: tuple) -> pd.DataFrame:
     # Re-downloaded only when the table actually changed — see
-    # dept_mapping.load_items_df.
-    return dept_mapping.load_items_df(ENGINE)
+    # dept_mapping.load_items_df. (A copy: the first caller gets this very
+    # object, and a page may add columns of its own to what it's given.)
+    return dept_mapping.load_items_df(ENGINE).copy()
+
+
+def load_items() -> pd.DataFrame:
+    return _load_items(_items_fingerprint())
+
+
+def _clear_load_items() -> None:
+    _items_fingerprint.clear()
+    _load_items.clear()
+
+
+load_items.clear = _clear_load_items
+
+
+def clear_items_cache(upcs=None) -> None:
+    """After the item master changed: drop the cached copy and start the new
+    download in the background right away (see load_items). upcs: the items
+    that changed, when it's only a few — just those are re-read (a second or
+    so instead of the whole item master)."""
+    patched = bool(upcs) and len(upcs) <= 5000 and dept_mapping.patch_items_memo(ENGINE, upcs)
+    load_items.clear()
+    if "load_stale_seen" in globals():
+        load_stale_seen.clear()  # (what no file has any more depends on the item master too)
+    if not patched:
+        dept_mapping.refresh_items_in_background(ENGINE)
 
 
 @st.cache_data(show_spinner=False)
@@ -552,16 +781,17 @@ def load_raw_item_counts() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_ingestion_log(source_key: str) -> pd.DataFrame:
+def load_ingestion_log(source_key: str | None = None) -> pd.DataFrame:
+    """Uploads, newest first — one source's, or every source's (None)."""
     with db_connect_cached() as conn:
         return pd.read_sql(
             text(
-                "SELECT id, uploaded_at, uploaded_by, original_filename, rows_parsed, rows_staged, "
+                "SELECT id, source_key, uploaded_at, uploaded_by, original_filename, rows_parsed, rows_staged, "
                 "dropped_invalid_upc, dropped_duplicate_upc FROM dbo.ingestion_log "
-                "WHERE source_key = :sk ORDER BY uploaded_at DESC"
+                + ("WHERE source_key = :sk " if source_key else "") + "ORDER BY uploaded_at DESC"
             ),
             conn,
-            params={"sk": source_key},
+            params={"sk": source_key} if source_key else {},
         )
 
 
@@ -717,7 +947,7 @@ def apply_settings_change(what: str) -> None:
     """A Settings change only matters once the Department engine re-runs
     with it — so it re-runs right away (and the item master's Department
     follows), instead of waiting for the next Merge."""
-    with st.spinner(f"Saved {what}. Re-running the Department engine with the new settings (about a minute)..."):
+    with st.spinner(f"Saved {what}. Re-running the Department engine with the new settings..."):
         before = dept_mapping.combo_decision_map(ENGINE)
         try:
             summary, discarded = dept_mapping.run_engine_guarded(ENGINE, st.session_state["name"])
@@ -734,7 +964,7 @@ def apply_settings_change(what: str) -> None:
     clear_dept_suggestion_caches()
     load_decided_combos.clear()
     load_broken_out_combos.clear()
-    load_items.clear()
+    clear_items_cache()
     clear_settings_caches()
     msg = (f"Saved {what} and re-ran the Department engine — {moved:,} group(s) changed tab or department, "
            f"{synced['items']:,} item department(s) updated in Item Master.")
@@ -825,25 +1055,26 @@ def render_discard_notices(entity_type: str) -> None:
 
 def render_blocked_item_master_edits(blocked: dict) -> None:
     """First-write-wins feedback for Item Master/Add Item/Delete Item/UPC
-    Overrides — shown immediately to whoever's edit just got skipped
-    because someone else already had a pending edit staged for that same
-    UPC. `blocked` is {upc: {change_type, description, department,
+    Overrides — shown immediately to whoever's change just got skipped
+    because a change was already staged for that same UPC (by them or by
+    someone else). `blocked` is {upc: {change_type, description, department,
     staged_by, staged_at}} as returned by save_item_master_pending(_bulk)."""
     if not blocked:
         return
-    label = "item" if len(blocked) == 1 else "items"
+    me = st.session_state.get("name")
+    what = {"add": "an add", "delete": "a delete", "edit": "an edit"}
     with st.container(border=True):
-        st.error(f"{len(blocked)} {label} already had a pending edit staged by someone else — yours wasn't saved for those.")
+        n = len(blocked)
+        st.error(f"{n} {'item' if n == 1 else 'items'} already {'has' if n == 1 else 'have'} a change waiting on "
+                 "Pending Changes — yours wasn't saved for " + ("it." if n == 1 else "those."))
         for upc, row in blocked.items():
-            when_str = pd.to_datetime(row.get("staged_at"), errors="coerce")
-            when_str = when_str.strftime("%Y-%m-%d %H:%M") if pd.notna(when_str) else ""
+            who = "You" if row.get("staged_by") == me else (row.get("staged_by") or "Someone")
             st.caption(
-                f"**{upc}** — {row.get('description') or '(no description)'}: already staged as a "
-                f"**{row['change_type']}** to **{row.get('department') or '(no department)'}** by "
-                f"**{row.get('staged_by') or 'unknown'}**" + (f" on {when_str}" if when_str else "") +
-                " — undo it on Pending Changes first if you want to replace it with yours."
+                f"**{upc}** — {row.get('description') or '(no description)'}: {who} staged "
+                f"{what.get(row['change_type'], 'a change')}"
+                + (f" to **{row['department']}**" if row.get("department") else "")
+                + f" ({fmt_when(row.get('staged_at'))}). Push it or take it back (Undo) on Pending Changes first."
             )
-
 
 def render_auto_merge_result(result: dict | None) -> None:
     """Compact status line for wherever auto_recompute_and_push_merge()
@@ -860,11 +1091,17 @@ def render_auto_merge_result(result: dict | None) -> None:
     # review it there would be a dead end. They still deserve to know a
     # fresh draft exists and that it's now an admin's move, just not a
     # link to a tab that isn't there for them.
-    where = "Review and push it from the Merge tab when ready." if is_admin else "An admin will review and push it."
-    st.info(
-        f"\U0001f504 A fresh merge draft is ready — {result.get('added_count') or 0:,} new item(s) to add "
-        f"(existing items are never changed by a Merge). {where}"
-    )
+    where = "Review and push it on the Merge tab." if is_admin else "An admin will review and push it."
+    msg = (f"A fresh merge draft is ready — {result.get('added_count') or 0:,} new item(s) to add "
+           f"(existing items are never changed by a Merge). {where}")
+    if not is_admin:
+        st.info(msg)
+        return
+    c1, c2 = st.columns([5, 1.2], vertical_alignment="center")
+    c1.info(msg)
+    # (a callback: this notice is only drawn once, so the click is handled before the next run draws the page)
+    c2.button("Go to Merge", key="auto_merge_goto", width='stretch', type="primary",
+              on_click=lambda: st.session_state.update(_nav_to_tab="Merge"))
 
 
 @st.cache_data(show_spinner=False)
@@ -880,13 +1117,24 @@ def load_rejected_rows(log_id: int) -> pd.DataFrame:
         )
 
 
+@st.cache_resource(show_spinner=False)
+def _ensure_deleted_return_columns() -> bool:
+    """The deleted list's "came back in a newer file" columns (once per server)."""
+    from itemmaster.ingest import DELETED_RETURN_DDL
+    with db_begin() as conn:
+        conn.execute(text(DELETED_RETURN_DDL))
+        upload_reports.ensure_tables(conn)  # (combined_into, and the upload report tables)
+    return True
+
+
 @st.cache_data(show_spinner=False)
 def load_deleted_items() -> pd.DataFrame:
+    _ensure_deleted_return_columns()
     with db_connect_cached() as conn:
         return pd.read_sql(
             text(
                 "SELECT upc, description, department, category, subcategory, brand, pack, size, uom, "
-                "deleted_by, deleted_at FROM dbo.deleted_upcs ORDER BY deleted_at DESC"
+                "deleted_by, deleted_at, returned_at, returned_file, combined_into, source_key FROM dbo.deleted_upcs ORDER BY deleted_at DESC"
             ),
             conn,
         )
@@ -1006,7 +1254,7 @@ def sql_value(v):
     DataFrame — pyodbc can't bind that into an NVARCHAR column ('not a
     valid instance of data type float'). Convert it back to a real None
     before passing any DataFrame-sourced value as a bound query parameter."""
-    return None if pd.isna(v) else v
+    return None if (not isinstance(v, str) and pd.isna(v)) or (isinstance(v, str) and v == "") else v
 
 
 SOURCE_NUMERIC_BOOL_COLUMNS = {"enabled", "priority_rank", "header_row", "strip_trailing_digits"}
@@ -1112,6 +1360,7 @@ def _sync_dept_tab(tab_key: str) -> None:
     makes "clear this tab" or "change sort here" propagate everywhere by
     default, with locking as the opt-out rather than the other way
     around."""
+    st.session_state["_dept_dirty"] = True  # the other sections pick up a shared filter change in the catch-up
     values = _current_dept_values(tab_key)
     get_dept_tab_filters()[tab_key] = values
     if not get_dept_tab_locks().get(tab_key, False):
@@ -1122,6 +1371,11 @@ def get_dept_facets(tab_key: str) -> dict:
     """Each tab's own Source / Department / … picks — a plain dict, not the
     widgets' keys (see get_dept_tab_filters for why)."""
     return st.session_state.setdefault("dept_facets", {}).setdefault(tab_key, {})
+
+
+FACET_PLACEHOLDERS = {"Source": "All sources", "Old Department": "All old departments", "Suggested": "Any suggestion",
+                      "Being worked on by": "Anyone", "Decided as": "Any department", "Status": "Any status",
+                      "Decided by": "Anyone"}
 
 
 def apply_facets(df: pd.DataFrame, picks: dict) -> pd.DataFrame:
@@ -1174,7 +1428,7 @@ def render_filter_bar(tab_key: str, sort_options: dict, search_label: str, searc
         # own private settings, so toggling it on never loses anything.
         get_dept_tab_filters()[tab_key] = _current_dept_values(tab_key)
 
-    fcol1, fcol2, fcol3 = st.columns([4, 1, 1.2])
+    fcol1, fcol2, fcol3 = st.columns([3.5, 1.4, 1.2])  # (room for "Lock filters" on one line)
     search = fcol1.text_input(
         search_label, key=search_key, label_visibility="collapsed",
         placeholder=search_placeholder, on_change=_touch,
@@ -1190,11 +1444,11 @@ def render_filter_bar(tab_key: str, sort_options: dict, search_label: str, searc
         get_dept_facets(tab_key).clear()
         if not is_locked:
             shared.update(defaults)
-        st.rerun()
+        dept_rerun()
 
     facets = facets or {}
     picks = get_dept_facets(tab_key)
-    cols = st.columns([1.3] * len(facets) + [1.6, 0.9])
+    cols = st.columns([1.2] * len(facets) + [1.5, 1.15])
     for (flabel, col), c in zip(facets.items(), cols):
         choices = sorted(df[col].fillna("(none)").astype(str).unique()) if df is not None and col in df.columns else []
         wkey = f"{tab_key}_facet_{col}"
@@ -1202,11 +1456,11 @@ def render_filter_bar(tab_key: str, sort_options: dict, search_label: str, searc
 
         def _pick(col=col, wkey=wkey):
             picks[col] = st.session_state[wkey]
-        c.multiselect(flabel, choices, key=wkey, on_change=_pick, placeholder=f"All {flabel.lower()}" + ("es" if flabel.endswith("s") else "s"),
+        c.multiselect(flabel, choices, key=wkey, on_change=_pick, placeholder=FACET_PLACEHOLDERS.get(flabel, f"Any {flabel.lower()}"),
                       label_visibility="collapsed", format_func=lambda v, col=col: v.upper() if col == "source_key" else v)
     sort_label = cols[-2].selectbox("Sort by", list(sort_options.keys()), key=sort_key, on_change=_touch,
                                     label_visibility="collapsed", format_func=lambda x: f"Sort: {x}")
-    with cols[-1].container(key="dept_sort_desc_wrap"):
+    with cols[-1].container(key=f"dept_sort_desc_wrap_{tab_key}"):
         sort_desc = st.checkbox("Descending", key=desc_key, on_change=_touch)
     if facets:
         return search, sort_options[sort_label], sort_desc, {c: picks.get(c, []) for c in facets.values()}
@@ -1251,6 +1505,13 @@ def render_page_controls(tab_key: str, page_num_key: str, df_len: int, matching_
                                   label_visibility="collapsed", help="Page")
     with pcol3.container(key=f"{tab_key}_page_caption"):
         st.caption(f"{matching_label} · page {page_num} of {total_pages}")
+    if st.session_state.get("_scroll_to_list") == tab_key:  # (paged from the bottom: show the new page from its top)
+        st.session_state.pop("_scroll_to_list")
+        st.html("""<script>
+(() => { let n = 0; const go = () => { const el = document.querySelector('.st-key-KEY_page_caption');
+  if (!el || !el.offsetParent) { if (n++ < 40) setTimeout(go, 100); return; }
+  el.scrollIntoView({behavior: "instant", block: "center"}); }; setTimeout(go, 50); })();
+</script>""".replace("KEY", tab_key), unsafe_allow_javascript=True)
     return page_size, page_num, total_pages
 
 
@@ -1272,6 +1533,7 @@ def render_search_bar(tab_key: str, search_label: str, search_placeholder: str) 
     def _touch():
         value = st.session_state.get(search_key, "")
         get_dept_tab_filters()[tab_key] = {"search": value}
+        st.session_state["_dept_dirty"] = True
         if not locks.get(tab_key, False):
             shared["search"] = value
 
@@ -1279,7 +1541,7 @@ def render_search_bar(tab_key: str, search_label: str, search_placeholder: str) 
         locks[tab_key] = st.session_state[lock_key]
         get_dept_tab_filters()[tab_key] = {"search": st.session_state.get(search_key, "")}
 
-    fcol1, fcol2, fcol3 = st.columns([4, 1, 1.2])
+    fcol1, fcol2, fcol3 = st.columns([3.5, 1.4, 1.2])  # (room for "Lock filters" on one line)
     search = fcol1.text_input(
         search_label, key=search_key, label_visibility="collapsed",
         placeholder=search_placeholder, on_change=_touch,
@@ -1290,7 +1552,7 @@ def render_search_bar(tab_key: str, search_label: str, search_placeholder: str) 
         get_dept_tab_filters()[tab_key] = {"search": ""}
         if not is_locked:
             shared["search"] = ""
-        st.rerun()
+        dept_rerun()
     return search
 
 
@@ -1302,14 +1564,14 @@ def search_groups(df: pd.DataFrame, search: str, extra_cols: tuple = ()) -> pd.D
         return df
     s = search.lower()
     mask = (
-        df["source_key"].str.lower().str.contains(s, na=False)
-        | df["raw_department"].str.lower().str.contains(s, na=False)
-        | df["raw_category"].str.lower().str.contains(s, na=False)
-        | df["raw_subcategory"].str.lower().str.contains(s, na=False)
+        df["source_key"].str.lower().str.contains(s, na=False, regex=False)
+        | df["raw_department"].str.lower().str.contains(s, na=False, regex=False)
+        | df["raw_category"].str.lower().str.contains(s, na=False, regex=False)
+        | df["raw_subcategory"].str.lower().str.contains(s, na=False, regex=False)
         | combo_label_series(df).str.lower().str.contains(s, regex=False)
     )
     for c in extra_cols:
-        mask |= df[c].fillna("").astype(str).str.lower().str.contains(s, na=False)
+        mask |= df[c].fillna("").astype(str).str.lower().str.contains(s, na=False, regex=False)
     return df[mask]
 
 
@@ -1339,10 +1601,12 @@ def render_bottom_pagination(page_size_key: str, page_num_key: str, tab_key: str
     def _sync_size():
         st.session_state[page_size_key] = st.session_state[size_widget_key]
         st.session_state[page_num_key] = 1
+        st.session_state["_scroll_to_list"] = tab_key  # (back up to the top of the new page)
         _sync_dept_tab(tab_key)
 
     def _sync_num():
         st.session_state[page_num_key] = st.session_state[num_widget_key]
+        st.session_state["_scroll_to_list"] = tab_key
 
     st.divider()
     c1, c2, _ = st.columns([1, 1, 3])
@@ -1350,32 +1614,12 @@ def render_bottom_pagination(page_size_key: str, page_num_key: str, tab_key: str
     c2.number_input("Page", min_value=1, max_value=total_pages, step=1, key=num_widget_key, on_change=_sync_num)
 
 
-# Up to this many items, a group's list comes with the page (all the page's
-# lists in one query), so Show affected items opens and closes instantly
-# without reloading anything — which covers every group there is today.
-AFFECTED_INSTANT_MAX = 50000
-_AFFECTED = {}  # combo_id -> its items, for this page (filled by prefetch_affected_items)
-
-
 # ===========================================================================
 # Department Review: Show affected items
 # ===========================================================================
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_member_items_bulk(combo_ids: tuple) -> pd.DataFrame:
-    return dept_mapping.get_combo_member_items_bulk(ENGINE, list(combo_ids))
-
-
 def prefetch_affected_items(groups) -> None:
-    """groups: (combo_id, item count) pairs about to be shown on this page."""
-    ids = tuple(sorted({int(c) for c, n in groups if n and int(n) <= AFFECTED_INSTANT_MAX and int(c) not in _AFFECTED}))
-    if not ids:
-        return
-    df = load_member_items_bulk(ids)
-    for cid, g in df.groupby("combo_id"):
-        _AFFECTED[int(cid)] = g.drop(columns="combo_id")
-    for cid in ids:
-        _AFFECTED.setdefault(cid, df.iloc[0:0].drop(columns="combo_id"))
+    """(Nothing to do: each group's list loads only when it's opened.)"""
 
 
 def _affected_items_table(items_df: pd.DataFrame) -> None:
@@ -1394,33 +1638,30 @@ def _affected_items_table(items_df: pd.DataFrame) -> None:
 
 
 def render_affected_items_expander(combo_id: int, n_upcs_total: int, key_prefix: str, container=st) -> None:
-    """A per-combo "see the actual rows this affects" drill-down — the
-    aggregate count alone ("1,359 item(s)") doesn't let a person confirm
-    they're really the items they think they are before approving a
-    whole group at once. Collapsed by default. `container` lets a caller
-    place this inside a column instead of a full row of its own."""
+    """A per-group "see the actual items this affects" drill-down, collapsed.
+    Its list is fetched only when it's opened, and opening or closing it
+    redraws just that list — so a page of cards never loads tables nobody
+    opens. `container` places it inside a column instead of a row of its own."""
     label = f"Show affected items ({n_upcs_total:,})"
-    if n_upcs_total <= AFFECTED_INSTANT_MAX:
-        items_df = _AFFECTED.get(combo_id)
-        if items_df is None:
-            items_df = load_combo_member_items(combo_id)
-        with container.expander(label, key=f"{key_prefix}_{combo_id}"):
-            _affected_items_table(items_df)
-    elif container is st:
-        _affected_items(combo_id, label, key_prefix)
+    if container is st:
+        _affected_items(combo_id, label, key_prefix, n_upcs_total)
     else:
         with container:
-            _affected_items(combo_id, label, key_prefix)
+            _affected_items(combo_id, label, key_prefix, n_upcs_total)
 
 
 @st.fragment
-def _affected_items(combo_id: int, label: str, key_prefix: str) -> None:
-    # A very large group: its list is fetched only once it's opened, and
-    # opening/closing redraws just this list, not the page.
+def _affected_items(combo_id: int, label: str, key_prefix: str, n_upcs_total: int = 0) -> None:
     exp = st.expander(label, key=f"{key_prefix}_{combo_id}", on_change="rerun")
     with exp:
         if exp.open:
             _affected_items_table(load_combo_member_items(combo_id))
+        else:
+            # Drawn at the list's own size while it's closed: opening shows
+            # this (shimmering) straight away, and the list lands in the same
+            # space — the box doesn't grow a second time.
+            h = min(300, 40 + 35 * max(n_upcs_total, 1))
+            st.html(f'<div class="app-aff-ph" style="height:{h}px"></div>')
 
 
 # ===========================================================================
@@ -1467,7 +1708,25 @@ def load_broken_out_claims() -> dict:
     return dept_mapping.get_broken_out_claims(ENGINE)
 
 
+@st.cache_data(show_spinner=False)
+def load_group_primaries(combo_ids: tuple) -> dict:
+    return dept_mapping.get_broken_out_group_primaries(ENGINE, list(combo_ids))
+
+
+@st.cache_data(show_spinner=False)
+def load_import_summary() -> dict:
+    return dept_mapping.old_workbook_import_summary(ENGINE)
+
+
+@st.cache_data(show_spinner=False)
+def load_undo_requests(kind: str, combo_ids: tuple) -> dict:
+    return dept_mapping.get_undo_requests(ENGINE, kind, list(combo_ids))
+
+
 def clear_dept_suggestion_caches() -> None:
+    load_group_primaries.clear()
+    load_import_summary.clear()
+    load_undo_requests.clear()
     load_undo_redo.clear()
     load_combo_suggestions.clear()
     load_upc_change_suggestions.clear()
@@ -1503,7 +1762,7 @@ def render_combo_suggestion_disputes(disputed: dict) -> None:
                      "agreement list until you check it again.",
             )
             hc1.markdown(f"**{(first['source_key'] or '').upper()}** — {first['label']}  \nPeople disagree — vote below")
-            hc1.caption(f"{first['n_upcs_total']:,} items")
+            hc1.caption(n_items(first['n_upcs_total']))
             card_actions(hc_act, f"undo_dispute_{combo_id}",
                          partial(open_undo_picker, combo_id, f"{(first['source_key'] or '').upper()} — {first['label']}"),
                          {"kind": "combo", "combo_id": combo_id, "tier": first.get("tier"),
@@ -1538,7 +1797,7 @@ def render_combo_suggestion_disputes(disputed: dict) -> None:
                             st.session_state["_toast"] = (f"Withdrew your vote on **{first['label']}** — no suggestions left.", "")
                         else:
                             st.session_state["_toast"] = (f"Withdrew your vote on **{first['label']}**.", "")
-                        st.rerun()
+                        dept_rerun()
                 else:
                     label = "Change vote" if actor_current_vote else "I also think this"
                     if col.button(label, key=f"agree_combo_{combo_id}_{department}", width='stretch'):
@@ -1550,7 +1809,7 @@ def render_combo_suggestion_disputes(disputed: dict) -> None:
                         clear_dept_suggestion_caches()
                         if not result["disputed"]:
                             st.session_state["_toast"] = (f"Resolved: **{first['label']}** → {department}.", "")
-                        st.rerun()
+                        dept_rerun()
             if not actor_current_vote:
                 nc1, nc2 = st.columns([3, 1.4])
                 new_dept_options = sorted(d for d in load_departments()["department"].tolist() if d not in by_dept)
@@ -1574,7 +1833,7 @@ def render_combo_suggestion_disputes(disputed: dict) -> None:
                         )
                     elif not result["disputed"]:
                         st.session_state["_toast"] = (f"Resolved: **{first['label']}** → {new_dept}.", "")
-                    st.rerun()
+                    dept_rerun()
             render_affected_items_expander(combo_id, first["n_upcs_total"], "dispute_items")
 
 
@@ -1649,20 +1908,20 @@ def render_upc_change_suggestions(suggestions_by_upc: dict, pending_upc_changes:
                         _accept(it["upc"], suggested_by, department)
                     clear_dept_suggestion_caches()
                     st.session_state["_toast"] = (f"Accepted: {len(items)} item(s) → {department}.", "")
-                    st.rerun()
+                    dept_rerun()
                 if gc3.button(deny_label, key=f"deny_upc_group_{key_base}", width='stretch'):
                     for it in items:
                         _deny(it["upc"], suggested_by)
                     clear_dept_suggestion_caches()
                     st.session_state["_toast"] = (f"Denied: {len(items)} suggestion(s).", "")
-                    st.rerun()
+                    dept_rerun()
             elif can_withdraw:
                 if gc2.button(withdraw_label, key=f"withdraw_upc_group_{key_base}", width='stretch'):
                     for it in items:
                         _deny(it["upc"], suggested_by)
                     clear_dept_suggestion_caches()
                     st.session_state["_toast"] = (f"Withdrew {len(items)} suggestion(s).", "")
-                    st.rerun()
+                    dept_rerun()
             else:
                 gc2.caption(f"Only {owner or 'the owner'} or an admin can accept/deny this.")
 
@@ -1676,18 +1935,18 @@ def render_upc_change_suggestions(suggestions_by_upc: dict, pending_upc_changes:
                             _accept(it["upc"], suggested_by, department)
                             clear_dept_suggestion_caches()
                             st.session_state["_toast"] = (f"Accepted: {it['upc']} → {department}.", "")
-                            st.rerun()
+                            dept_rerun()
                         if ic3.button("Deny", key=f"deny_upc_item_{key_base}_{it['upc']}", width='stretch'):
                             _deny(it["upc"], suggested_by)
                             clear_dept_suggestion_caches()
                             st.session_state["_toast"] = (f"Denied suggestion for {it['upc']}.", "")
-                            st.rerun()
+                            dept_rerun()
                     elif can_withdraw:
                         if ic2.button("Withdraw", key=f"withdraw_upc_item_{key_base}_{it['upc']}", width='stretch'):
                             _deny(it["upc"], suggested_by)
                             clear_dept_suggestion_caches()
                             st.session_state["_toast"] = (f"Withdrew suggestion for {it['upc']}.", "")
-                            st.rerun()
+                            dept_rerun()
             elif len(items) > INLINE_LIMIT:
                 with st.expander(f"Show item(s) ({len(items)})", key=f"upc_sugg_items_{key_base}"):
                     if can_act or can_withdraw:
@@ -1716,20 +1975,20 @@ def render_upc_change_suggestions(suggestions_by_upc: dict, pending_upc_changes:
                                     _accept(it["upc"], suggested_by, department)
                                 clear_dept_suggestion_caches()
                                 st.session_state["_toast"] = (f"Accepted: {len(picked)} item(s) → {department}.", "")
-                                st.rerun()
+                                dept_rerun()
                             if pc2.button(f"Deny picked ({len(picked)})", key=f"deny_upc_picked_{key_base}", width='stretch', disabled=not picked):
                                 for it in picked:
                                     _deny(it["upc"], suggested_by)
                                 clear_dept_suggestion_caches()
                                 st.session_state["_toast"] = (f"Denied: {len(picked)} suggestion(s).", "")
-                                st.rerun()
+                                dept_rerun()
                         elif can_withdraw:
                             if pc1.button(f"Withdraw picked ({len(picked)})", key=f"withdraw_upc_picked_{key_base}", width='stretch', disabled=not picked):
                                 for it in picked:
                                     _deny(it["upc"], suggested_by)
                                 clear_dept_suggestion_caches()
                                 st.session_state["_toast"] = (f"Withdrew {len(picked)} suggestion(s).", "")
-                                st.rerun()
+                                dept_rerun()
                     else:
                         st.dataframe(
                             pd.DataFrame([
@@ -1791,7 +2050,7 @@ def clear_pending_for_combo(combo_id: int) -> None:
     load_dept_pending_upc_changes.clear()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_resource(ttl=30, show_spinner=False)  # read once per card: no copy per read (it's only read)
 def load_group_facts() -> dict:
     return dept_mapping.group_facts(ENGINE)
 
@@ -1840,7 +2099,7 @@ def group_line(combo_id: int, change: dict | None = None, note: str | None = Non
     """One short gray line for a staged group card, plus the longer
     listed-twice detail (shown as the line's tooltip)."""
     f = load_group_facts().get(combo_id) or {}
-    bits = [f"{int(f.get('n_upcs_total') or 0):,} items"] if f else []
+    bits = [n_items(f.get('n_upcs_total'))] if f else []
     if change:
         when = local_time(change.get("staged_at"))
         who = f"Staged by {change.get('staged_by') or 'unknown'}" + (f", {when}" if when else "")
@@ -1883,7 +2142,7 @@ def group_origin_lines(combo_id: int, note: str | None = None) -> list:
             now = f"auto-decided as {dept}"
         else:
             now = "not decided yet"
-        lines.append(f"In the app now: **{f['where']}** · {now} · {int(f['n_upcs_total'] or 0):,} items")
+        lines.append(f"In the app now: **{f['where']}** · {now} · {n_items(f['n_upcs_total'])}")
     if note:
         lines.append(short_note(note))
     if combo_id in open_choice_groups():
@@ -1892,6 +2151,12 @@ def group_origin_lines(combo_id: int, note: str | None = None) -> list:
     if twice:
         lines.append(f"Old workbook note: {twice}")
     return lines
+
+
+def n_items(n, word: str = "item") -> str:
+    """ "1 item", "2 items" """
+    n = int(n or 0)
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
 
 
 def local_time(v, fmt: str = "%b %d %I:%M %p") -> str:
@@ -1966,7 +2231,7 @@ def render_import_choices() -> None:
             continue
         n = int((load_group_facts().get(int(c["combo_id"])) or {}).get("n_upcs_total") or 0)
         with st.container(border=True):
-            st.markdown(f"**{c['label']}** · {n:,} items")
+            st.markdown(f"**{c['label']}** · {n_items(n)}")
             st.caption(f"{c['workbook_says']} {c['app_has']}")
             cols = st.columns(len(options))
             for i, (col, o) in enumerate(zip(cols, options)):
@@ -1981,7 +2246,7 @@ def render_import_choices() -> None:
                             dept_mapping.close_import_choice(ENGINE, cid_key, "kept", actor, picked=o["text"])
                             load_import_choices.clear()
                             st.session_state["_toast"] = (f"Kept as it is: **{c['label']}**", "")
-                            st.rerun()
+                            dept_rerun()
                         apply_import_choice({**c, "alt_action": o["goto"], "alternative": o["text"], "items": o.get("items")})
     if closed:
         with st.expander(f"Choices already made ({len(closed)})", key="import_choices_closed"):
@@ -1992,7 +2257,7 @@ def render_import_choices() -> None:
                 if x2.button("Ask again", key=f"choice_reopen_{c['choice_id']}", width="stretch",
                              help="Takes back what this choice staged and puts the question back."):
                     take_back_import_choice(c)
-                    st.rerun()
+                    dept_rerun()
 
 
 def option_in_effect(combo_id: int, options: list) -> int:
@@ -2156,8 +2421,15 @@ def push_item_master_add(upc: str, change: dict, actor: str) -> None:
 
 def push_item_master_delete(upc: str, change: dict, actor: str) -> None:
     with db_begin() as conn:
+        upload_reports.ensure_tables(conn)  # (dept_state)
         conn.execute(text("DELETE FROM dbo.items WHERE upc = :upc"), {"upc": upc})
         conn.execute(text("DELETE FROM dbo.manual_overrides WHERE upc = :upc"), {"upc": upc})
+        # It leaves its Department Review group (kept with the deleted record, for a restore); a
+        # Department decision someone staged on it no longer has an item to apply to.
+        dept_state = dept_mapping.take_out_of_groups(conn, upc)
+        dropped = conn.execute(text("SELECT staged_by, department FROM dbo.dept_mapping_pending_upc_changes WHERE upc = :upc"),
+                               {"upc": upc}).mappings().all()
+        conn.execute(text("DELETE FROM dbo.dept_mapping_pending_upc_changes WHERE upc = :upc"), {"upc": upc})
         conn.execute(
             text(
                 """
@@ -2166,86 +2438,211 @@ def push_item_master_delete(upc: str, change: dict, actor: str) -> None:
                 WHEN MATCHED THEN UPDATE SET
                     description = :description, department = :department,
                     category = :category, subcategory = :subcategory, brand = :brand,
-                    pack = :pack, size = :size, uom = :uom,
+                    pack = :pack, size = :size, uom = :uom, combined_into = :combined_into, source_key = :source_key,
+                    dept_state = :dept_state, returned_at = NULL, returned_file = NULL,
                     deleted_by = :deleted_by, deleted_at = SYSUTCDATETIME()
                 WHEN NOT MATCHED THEN INSERT
-                    (upc, description, department, category, subcategory, brand, pack, size, uom, deleted_by)
+                    (upc, description, department, category, subcategory, brand, pack, size, uom, deleted_by, combined_into, source_key, dept_state)
                 VALUES
-                    (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :deleted_by);
+                    (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :deleted_by, :combined_into, :source_key, :dept_state);
                 """
             ),
             {
                 "upc": upc, "description": change["description"], "department": change["department"],
                 "category": change["category"], "subcategory": change["subcategory"], "brand": change["brand"],
                 "pack": change.get("pack"), "size": change.get("size"), "uom": change.get("uom"), "deleted_by": actor,
+                "combined_into": change.get("combined_into"), "source_key": change.get("source_key"),
+                "dept_state": dept_state,
             },
         )
+    for d in dropped:  # (they're told — the same notice a Merge leaves when it takes staged work back)
+        dept_mapping.record_discard_notice(
+            ENGINE, "item_master", f"Department decision on {upc} — {change.get('description') or '(no description)'}",
+            d["staged_by"], f"{actor} deleted the item, so the Department you staged for it ({d['department'] or 'blank'}) "
+            "no longer applies. If it's restored, decide it again.", actor)
 
 
-def render_monthly_refresh() -> None:
-    """All of this month's files at once: each is matched to its source by
-    File Keyword, cleaned with that source's settings, checked against its
-    last upload, and ingested together, then one Merge draft is computed.
-    The same code runs unattended from scripts/monthly_refresh.py."""
-    with st.expander("Monthly refresh — upload all of this month's files at once",
-                     expanded=bool(st.session_state.get("_mr_reports"))):
-        st.caption(
-            "Drop all of this month's files — each is matched to its source, checked, then a Merge draft is computed.",
-            help=("Drop every distributor file for the month. Each is matched to its source by the source's File Keyword "
-            "(Sources tab), read with that source's cleaning rules, and compared with its last upload — a file much "
-            "smaller than last time is held back until you tick it. Then one Merge draft is computed with every "
-            "Department Review decision applied; review and push it on the Merge tab. For hosting, "
-            "`scripts/monthly_refresh.py` does the same from an inbox folder on a schedule."),
-        )
-        ver = st.session_state.get("_mr_ver", 0)
-        files = st.file_uploader("This month's files", type=["xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
-                                 key=f"mr_files_{ver}")
-        if not files:
-            st.session_state.pop("_mr_reports", None)
-            return
-        sources = monthly_refresh.load_sources(ENGINE)
-        cache = st.session_state.setdefault("_mr_reports", {})
-        for f in files:
-            k = (f.name, f.size)
-            if k not in cache:
-                with st.spinner(f"Reading {f.name}..."):
-                    cache[k] = monthly_refresh.check_file(ENGINE, f, sources)
-        reps = [cache[(f.name, f.size)] for f in files]
-        keys = [r["source_key"] for r in reps if r.get("source_key")]
-        dup = {k for k in keys if keys.count(k) > 1}
-        label = {"ready": "Ready", "suspicious": "Much smaller than last time", "error": "Can't read",
-                 "skipped": "No matching source"}
-        st.dataframe(pd.DataFrame([{
-            "File": r["file"], "Source": r.get("source_key") or "—",
-            "Rows": r.get("rows"), "Rows last time": r.get("previous_rows"),
-            "Status": ("Two files for this source" if r.get("source_key") in dup else label.get(r["status"], r["status"])),
-            "Why": r["note"],
-        } for r in reps]), hide_index=True, width='stretch')
-        take = [r for r in reps if r["status"] == "ready" and r.get("source_key") not in dup]
-        sus = [r for r in reps if r["status"] == "suspicious" and r.get("source_key") not in dup]
-        for r in sus:
-            if st.checkbox(f"Ingest {r['file']} anyway ({r['note']})", key=f"mr_ok_{ver}_{r['file']}"):
-                take.append(r)
-        missing = sorted(set(sources[sources["enabled"] == True]["source_key"]) - {r.get("source_key") for r in take})  # noqa: E712
-        if missing:
-            st.caption(f"Not refreshed this time (keeps last month's data): {', '.join(missing)}.")
-        if st.button(f"Ingest {len(take)} file(s) and compute the Merge draft", type="primary", disabled=not take,
-                     key=f"mr_go_{ver}"):
-            actor = st.session_state["name"]
-            prog = st.progress(0.0, text="Ingesting...")
-            for i, r in enumerate(take):
-                prog.progress(i / (len(take) + 1), text=f"Ingesting {r['file']} into {r['source_key']}...")
-                monthly_refresh.ingest_checked(ENGINE, r, actor)
-            prog.progress(len(take) / (len(take) + 1), text="Computing the Merge draft...")
-            st.session_state["_upload_auto_merge_result"] = monthly_refresh.compute_draft(ENGINE, actor)
-            prog.empty()
-            for fn in (load_raw_item_counts, load_ingestion_log, load_stale_sources, load_stale_sources_since_compute):
-                fn.clear()
+def render_uploads() -> None:
+    """One upload box for any number of files — one source's, a few, or the
+    whole month's. Each file is matched to its source by its name (the
+    source's File Keyword); one it can't place gets a "which source?" pick,
+    and any match can be changed. Each file is cleaned with its source's
+    settings and checked, then shown with what it would add and drop; one
+    Save brings in every file that's ready and computes one Merge draft.
+    The same checks run unattended in scripts/monthly_refresh.py."""
+    ver = st.session_state.get("_mr_ver", 0)
+    files = st.file_uploader(
+        "Upload files", type=["xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True, key=f"mr_files_{ver}",
+        help="One file or several — each is matched to its source by its name. A file for a source you don't "
+             "upload this time leaves that source's data as it is.")
+    if not files:
+        st.session_state.pop("_mr_reports", None)
+        st.caption("Drop one file or several (up to one per source). Each is matched to its source by its name, "
+                   "checked against that source's settings and its current data, and shown before anything is saved.")
+        return
+    files = list({(f.name, f.size): f for f in files}.values())  # (the same file added twice counts once)
+    sources = monthly_refresh.load_sources(ENGINE)
+    labels = dict(zip(sources["source_key"], sources["source_label"]))
+    enabled = sources[sources["enabled"] == True]["source_key"].tolist()  # noqa: E712
+    picks = st.session_state.setdefault("_mr_pick", {})  # {(name, size): source picked by hand}
+    cache = st.session_state.setdefault("_mr_reports", {})
+    reps = []
+    for f in files:
+        fk = (f.name, f.size)
+        k = (fk, picks.get(fk))
+        if k not in cache:
+            with st.spinner(f"Reading {f.name}..."):
+                cache[k] = monthly_refresh.check_file(ENGINE, f, sources, source_key=picks.get(fk))
+                cache[k]["_fk"] = fk
+                cache[k]["_detected"] = monthly_refresh.match_source(f.name, sources)[0]
+        reps.append(cache[k])
+    # Two usable files for one source is ambiguous — even when one of them is just its current data again
+    # (which one is meant can't be guessed). A rejected file doesn't count.
+    keys = [r["source_key"] for r in reps if r.get("source_key") and r["status"] in ("ready", "same")]
+    dup = {k for k in keys if keys.count(k) > 1}
+    status = {id(r): ("dup" if r.get("source_key") in dup and r["status"] in ("ready", "same") else r["status"]) for r in reps}
+    label = {"ready": "Ready", "error": "Rejected", "skipped": "Which source?", "same": "Same as current",
+             "dup": "Two files for this source"}
+    news = {r["_fk"]: new_items_in(r["_cleaned"]) for r in reps if r["status"] == "ready" and r.get("_cleaned") is not None}
+    st.dataframe(pd.DataFrame([{
+        "File": r["file"], "Source": labels.get(r.get("source_key")) or r.get("source_key") or "—",
+        "Status": label.get(status[id(r)], status[id(r)]),
+        "New items": len(news[r["_fk"]]) if r["_fk"] in news else (0 if r["status"] == "same" else None),
+        "Rows": r.get("rows"), "Rows last time": r.get("previous_rows"),
+    } for r in reps]).astype({"New items": "Int64", "Rows": "Int64", "Rows last time": "Int64"}),  # (blank = not known)
+        hide_index=True, width='stretch',
+        column_config={"Status": st.column_config.TextColumn(width="medium"),
+                       "New items": st.column_config.NumberColumn(format="localized", help="UPCs not in the item master yet"),
+                       "Rows": st.column_config.NumberColumn(format="localized"),
+                       "Rows last time": st.column_config.NumberColumn(format="localized")})
+
+    # A file it couldn't place (or placed somewhere else than meant): pick its source.
+    for r in reps:
+        fk = r["_fk"]
+        unplaced = r["status"] == "skipped" and not r.get("source_key")
+        unreadable = r["status"] == "error" and r.get("source_key") and fk not in picks
+        if unplaced or unreadable or fk in picks:
+            c1, c2 = st.columns([2.2, 1.6], vertical_alignment="center")
+            c1.markdown(f"**{r['file']}** — " + (
+                "its name doesn't say which source it's for." if unplaced and fk not in picks else
+                f"couldn't be read as {labels.get(r['source_key']) or r['source_key']} — if that's the wrong source, pick its source."
+                if unreadable else "source picked by hand."))
+            opts = [""] + enabled
+            cur = picks.get(fk) or ""
+            choice = c2.selectbox("Which source?", opts, index=opts.index(cur) if cur in opts else 0,
+                                  key=f"mr_pick_{ver}_{abs(hash(fk))}", label_visibility="collapsed",
+                                  format_func=lambda k: "Pick its source…" if not k else f"{labels.get(k) or k} ({k})")
+            if (choice or None) != picks.get(fk):
+                if choice:
+                    picks[fk] = choice
+                else:
+                    picks.pop(fk, None)
+                st.rerun()
+    # The full reason for anything that won't be saved.
+    for r in reps:
+        if status[id(r)] in ("error", "dup"):
+            if status[id(r)] == "dup":
+                why = (f"there's more than one file for {labels.get(r['source_key']) or r['source_key']}"
+                       + (" (this one matches its current data, another doesn't)" if r["status"] == "same" else "")
+                       + " — keep only the one you mean")
+            else:
+                why = r["note"].removeprefix(r["file"]).strip().rstrip(".")
+                why = why if not why.startswith(("isn't", "has ", "is ", "uses ", "couldn't")) else "it " + why
+            st.error(f"**{r['file']}** won't be saved: {why[:1].lower() + why[1:]}.")
+    same = [r for r in reps if status[id(r)] == "same"]
+    if same:
+        st.info(f"**{len(same)} file(s) are the same as their source's current data** — every row matches, so they're "
+                "left as they are (nothing new, nothing dropped): "
+                + ", ".join(f"{r['file']} ({labels.get(r['source_key']) or r['source_key']})" for r in same) + ".")
+    take = [r for r in reps if status[id(r)] == "ready"]
+
+    # Each file that's ready: what it brings in and what drops out.
+    for r in take:
+        sk = r["source_key"]
+        name = labels.get(sk) or sk
+        stats = r.get("stats") or {}
+        new = news[r["_fk"]]
+        with st.container(border=True, key=f"mr_file_{ver}_{sk}"):
+            st.markdown(f"**{r['file']}** → {name}")
+            if r.get("_detected") and r["_detected"] != sk:
+                st.warning(f"Its name looks like it's for **{labels.get(r['_detected']) or r['_detected']}**, not {name}. "
+                           "Check the source above before saving.")
+            m0, m1, m2, m3, m4 = st.columns(5)
+            m0.metric("New items", f"{len(new):,}", help="UPCs not in the item master yet — a Merge adds these, and only these.")
+            m1.metric("Rows read", f"{stats.get('rows_parsed', 0):,}")
+            diff = (int(r["rows"]) - int(r["previous_rows"])) if r.get("previous_rows") is not None else None
+            m2.metric("Will be kept", f"{r.get('rows', 0):,}", delta=f"{diff:+,} vs last upload" if diff else None,
+                      delta_color="off")
+            m3.metric("Invalid UPC", f"{stats.get('dropped_invalid_upc', 0):,}")
+            m4.metric("Duplicate UPC", f"{stats.get('dropped_duplicate_upc', 0):,}")
+            if stats.get("letter_upcs"):
+                st.warning(f"{stats['letter_upcs']:,} row(s) have letters in the UPC (e.g. "
+                           + ", ".join(f"“{x}”" for x in stats["letter_upc_examples"])
+                           + ") — those aren't UPCs, so they're left out (counted under Invalid UPC).")
+            render_new_items(new, "this file", f"mr_{ver}_{sk}")
+            render_gone_items(sk, name, r["_cleaned"], f"mr_{ver}_{sk}")
+            render_deleted_in_file(r["_cleaned"], sk, name, f"mr_{ver}_{sk}")
+    for r in same:  # (saving one anyway would still bring back a deleted item it lists)
+        render_deleted_in_file(r["_cleaned"], r["source_key"], labels.get(r["source_key"]) or r["source_key"],
+                               f"mr_{ver}_{r['source_key']}_same")
+    if take:
+        not_now = sorted(set(enabled) - {r["source_key"] for r in take} - {r["source_key"] for r in same if r.get("source_key")})
+        if not_now:
+            st.caption("Not in this upload (they keep their current data): "
+                       + ", ".join(labels.get(k) or k for k in not_now) + ".")
+    n_new = sum(len(news[r["_fk"]]) for r in take)
+    if take:
+        st.caption("Saving brings each file in and adds its new items to the item master straight away — each into "
+                   "its Department Review group (a decided group's Department applies at once). Existing items aren't "
+                   "changed. A safety snapshot is taken first, so it can be undone from Snapshots.")
+    if st.button((f"Save {len(take)} file(s)" + (f" and add {n_new:,} new item(s)" if n_new else ""))
+                 if take else "Nothing to save", type="primary", disabled=not take, key=f"mr_go_{ver}"):
+        actor = st.session_state["name"]
+        prog = st.progress(0.0, text="Saving...")
+        report = {"kind": "manual",
+                  "title": "One file (uploaded in the app)" if len(take) == 1 else f"{len(take)} files (uploaded in the app)"}
+        for i, r in enumerate(take):
+            prog.progress(i / (len(take) + 1), text=f"Saving {r['file']} for {labels.get(r['source_key']) or r['source_key']}...")
+            monthly_refresh.ingest_checked(ENGINE, r, actor, report)
+        load_upload_reports.clear()
+        n_files = len(take)
+        prog.progress(n_files / (n_files + 3), text="Working out what's new...")
+        draft = monthly_refresh.compute_draft(ENGINE, actor)
+        for fn in (load_raw_item_counts, load_ingestion_log, load_stale_sources, load_stale_sources_since_compute,
+                   load_item_master_pending):
+            fn.clear()
+        clear_merge_compute_caches()
+        n_add = int((draft or {}).get("added_count") or 0)
+        collide = staged_add_collisions() if n_add else []
+        if n_add and not collide and is_admin:
+            # One step: the new items go in now (only what's new — existing items and groups stay as they are).
+            base = (n_files + 1) / (n_files + 3)
+            res = dept_mapping.push_merge_compute(
+                ENGINE, actor, is_admin=True,
+                on_progress=lambda label, frac: prog.progress(min(0.99, base + (1 - base) * frac), text=label))
+            activity("Uploads & Merge", f"Added {n_add:,} new item(s) from {n_files} uploaded file(s)", None, n_add,
+                     details={k: v for k, v in res.items() if isinstance(v, (int, float, str, bool, type(None)))})
+            st.session_state["_upload_push_msgs"] = after_merge_push(res)
+            st.session_state["_upload_new_upcs"] = sorted({u_ for r in take for u_ in news[r["_fk"]]["UPC"]})
+            toast = f"Saved {n_files} file(s) and added {n_add:,} new item(s) to the item master."
+        elif n_add:
+            st.session_state["_upload_auto_merge_result"] = draft
+            st.session_state["_upload_push_msgs"] = [("warning",
+                f"Saved {n_files} file(s). Its {n_add:,} new item(s) aren't added yet: "
+                + (", ".join(f"{u_} is staged to be added by hand ({who or 'someone'})" for u_, who in collide)
+                   + " — finish or take that back on Pending Changes, then push on the Merge tab." if collide
+                   else "an admin adds them on the Merge tab."))]
+            toast = f"Saved {n_files} file(s) — the new items wait on the Merge tab."
+        else:
+            dept_mapping.discard_merge_compute(ENGINE)
             clear_merge_compute_caches()
-            st.session_state.pop("_mr_reports", None)
-            st.session_state["_mr_ver"] = ver + 1
-            st.session_state["_toast"] = (f"Ingested {len(take)} file(s). The Merge draft is ready on the Merge tab.", "")
-            st.rerun()
+            toast = f"Saved {n_files} file(s) — nothing new to add."
+        prog.empty()
+        st.session_state.pop("_mr_reports", None)
+        st.session_state.pop("_mr_pick", None)
+        st.session_state["_mr_ver"] = ver + 1
+        st.session_state["_toast"] = (toast + " See the Upload Reports tab for what each file added and dropped.", "")
+        st.rerun()
 
 
 @st.cache_data(show_spinner=False)
@@ -2277,7 +2674,7 @@ def render_bulk_upload(kind: str, title: str) -> None:
         try:
             df = item_bulk.read_upload(up)
         except Exception as e:
-            st.error(f"Couldn't read that file: {e}")
+            st.error(str(e))
             return
         if df.empty:
             st.warning("That file has no rows filled in.")
@@ -2304,15 +2701,23 @@ def render_bulk_upload(kind: str, title: str) -> None:
             + (f":red[**{int(problems.sum()):,} need fixing**]" if problems.any() else "0 need fixing")
         )
         only_problems = problems.any() and st.toggle("Show only rows that need fixing", key=f"bulk_{kind}_only_bad")
+        shown_preview = preview[problems] if only_problems else preview
         st.dataframe(
-            preview[problems] if only_problems else preview, hide_index=True, width='stretch',
-            height=min(420, 38 + 35 * len(preview)),
+            shown_preview, hide_index=True, width='stretch',
+            height=min(420, 38 + 35 * len(shown_preview)),  # (sized to the rows shown — no empty rows)
+            column_config={"Status": st.column_config.TextColumn(width="large")},
         )
         if problems.any():
             st.caption("Rows that need fixing are skipped — fix them in your file and upload it again, or stage the ready ones now.")
         verb = {"add": "adding", "delete": "deleting", "edit": "changing"}[kind]
         n_items = len(set(changes) | set(decisions))
         if st.button(f"Stage {verb} {n_items:,} item(s)", type="primary", disabled=not n_items, key=f"bulk_{kind}_stage"):
+            if kind == "delete":
+                # (the same as deleting them one by one: someone's work on an item is shown first)
+                st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
+                st.session_state[f"_bulk_{kind}_open"] = False
+                stage_deletes(list(changes), "Spreadsheet upload")
+                return
             n_dec = n_sugg = 0
             for cid, grp in pd.DataFrame([{"upc": u, **d} for u, d in decisions.items()]).groupby("combo_id") if decisions else []:
                 cid = int(cid)
@@ -2352,10 +2757,14 @@ def render_item_decisions(df: pd.DataFrame, key: str, file_stem: str) -> None:
     if df.empty:
         st.caption("No items.")
         return
-    got = df["Department"].notna() & (df["Department"].astype(str).str.strip() != "")
+    has = df["Department"].notna() & (df["Department"].astype(str).str.strip() != "")
+    # (a Merge draft's new item in a decided group gets that group's Department when pushed)
+    on_push = ~has & df["How"].fillna("").astype(str).str.endswith("filled in on push")
+    got = has | on_push
     counts = df["Decision"].value_counts()
-    st.markdown(f"**{len(df):,} item(s)** · {int(got.sum()):,} have a Department · "
-                f"{int((~got).sum()):,} don't yet")
+    st.markdown(f"**{len(df):,} item(s)** · {int(has.sum()):,} have a Department"
+                + (f" · {int(on_push.sum()):,} get one when pushed" if on_push.any() else "")
+                + f" · {int((~got).sum()):,} don't yet")
     st.caption(" · ".join(f"{k}: {v:,}" for k, v in counts.items()))
     f1, f2 = st.columns([1.3, 2])
     choice = f1.selectbox("Show", ["All", "Have a Department", "No Department yet"] + list(counts.index),
@@ -2560,7 +2969,7 @@ def render_settings_request_form() -> None:
             load_notifications.clear()
             st.session_state["_req_ver"] = ver + 1
             st.session_state["_toast"] = (f"Sent request #{res['request_id']} to the admins — you'll be notified when it's decided.", "")
-            st.rerun()
+            dept_rerun()
 
     mine = dept_mapping.list_settings_requests(ENGINE, requested_by=st.session_state["name"])
     if mine:
@@ -2576,7 +2985,7 @@ def render_settings_request_form() -> None:
                     dept_mapping.withdraw_settings_request(ENGINE, r["request_id"], st.session_state["name"])
                     load_notifications.clear()
                     st.session_state["_toast"] = (f"Withdrew request #{r['request_id']}.", "")
-                    st.rerun()
+                    dept_rerun()
 
     st.divider()
     st.markdown("#### Current settings (read-only)")
@@ -2673,7 +3082,7 @@ def render_old_workbook_import() -> None:
         cached = st.session_state.get("_owi")
         if not cached or cached["hash"] != digest:
             try:
-                with st.spinner("Reading the workbook and checking every decision against the app — about a minute…"):
+                with st.spinner("Reading the workbook and checking each decision against the app..."):
                     extracted = owi.extract(owi.read_workbook(io.BytesIO(data)))
                     p = owi.plan(ENGINE, extracted, load_departments()["department"].tolist(), st.session_state["name"])
             except ValueError as e:
@@ -2694,7 +3103,7 @@ def render_old_workbook_import() -> None:
         if b2.button(f"Stage {n_stage:,} change(s)" + (f", make {n_move:,} move(s)" if n_move else "")
                      + (f", take back {n_take:,}" if n_take else ""),
                      type="primary", key="owi_apply", width="stretch", disabled=not (n_stage or n_move or n_take)):
-            with st.spinner("Importing — staging everything as you…"):
+            with st.spinner("Importing and staging the changes..."):
                 result = owi.apply(ENGINE, p, st.session_state["name"], is_admin, up.name)
             activity("Department Review", f"Uploaded workbook {up.name}: {result['groups']:,} group decision(s), "
                      f"{result['item_decisions']:,} item decision(s), {result['overrides']:,} UPC override(s) staged, "
@@ -2720,8 +3129,9 @@ def item_master_pending_cross_link() -> dict:
     of being repeated on every page that can stage a change — it seemed
     weird to have to check three separate pages for the same queue."""
     pending = load_item_master_pending()
-    if pending:
-        st.caption(f"\U0001f4cb {len(pending):,} item change(s) staged, not yet pushed — see Pending Changes.")
+    # Always one line (so staging something doesn't push the page down).
+    st.caption(f"{len(pending):,} item change(s) staged, not yet pushed — see Pending Changes." if pending
+               else "Nothing staged yet — item changes you stage wait on Pending Changes until they're pushed.")
     return pending
 
 
@@ -2785,7 +3195,9 @@ def render_item_master_pending_section() -> dict:
 
     if visible_upcs:
         what = "all shown" if len(matching_upcs) <= page_size else f"all {len(matching_upcs):,} matching"
-        scol1, scol2, scol3 = st.columns([1.3, 1.3, 2.4])
+        scol, scol3 = st.columns([2.6, 2.4], vertical_alignment="bottom")
+        scol = scol.container(horizontal=True)
+        scol1 = scol2 = scol
         if scol1.button(f"Include {what}", key="im_pending_select_all"):
             for upc in matching_upcs:
                 st.session_state[f"im_pending_include_{upc}"] = True
@@ -2815,8 +3227,14 @@ def render_item_master_pending_section() -> dict:
                 help="Included in the next push — uncheck to save this one for later without losing it.",
             )
             action_label = {"add": "Add", "delete": "Delete", "edit": "Edit"}[change["change_type"]]
-            c1.markdown(f"**{action_label}** {upc} — {change['description'] or '(no description)'}")
-            c1.caption(f"Staged by {change.get('staged_by') or 'unknown'} at {change.get('staged_at')}")
+            if change.get("combined_into"):
+                action_label = "Combine"
+                c1.markdown(f"**Combine** {upc} into **{change['combined_into']}** — {change['description'] or '(no description)'}")
+                c1.caption(f"A duplicate: {change['combined_into']} is kept as it is; {upc} is removed and stays out, "
+                           "even when a file lists it again (undo it any time under Upload Reports → Possible duplicate UPCs → Combined).")
+            else:
+                c1.markdown(f"**{action_label}** {upc} — {change['description'] or '(no description)'}")
+            c1.caption(f"Staged by {change.get('staged_by') or 'unknown'} · {fmt_when(change.get('staged_at'))}")
             item_group = page_groups.get(upc)
             if item_group is not None:
                 f = load_group_facts().get(item_group, {})
@@ -2831,11 +3249,12 @@ def render_item_master_pending_section() -> dict:
             if change["change_type"] == "edit":
                 diffs = diff_pending_fields(old_values, change, item_fields, ITEM_MASTER_FIELD_LABELS)
                 if diffs:
-                    c1.caption("Changing: " + ", ".join(d[0] for d in diffs))
+                    c1.markdown(diffs_inline(diffs))
                 else:
                     c1.caption("No fields differ from the live item master.")
-                with st.expander(f"Full details ({len(diffs)} field(s) changing)", key=f"im_pending_expander_{upc}"):
-                    render_pending_field_table(diffs, ["Field", "Current", "Staged"])
+                if len(diffs) > 3:
+                    with st.expander(f"Full details ({len(diffs)} field(s) changing)", key=f"im_pending_expander_{upc}"):
+                        render_pending_field_table(diffs, ["Field", "Current", "Staged"])
             elif change["change_type"] == "add":
                 rows = [(ITEM_MASTER_FIELD_LABELS[f], _format_pending_value(change.get(f))) for f in item_fields if not _is_blank(change.get(f))]
                 with st.expander("Full details", key=f"im_pending_expander_{upc}"):
@@ -2848,23 +3267,23 @@ def render_item_master_pending_section() -> dict:
                 dept_mapping.delete_item_master_pending(ENGINE, upc)
                 activity("Items", f"Took back a staged {action_label.lower()} (staged by {change.get('staged_by') or '?'})", upc, 1)
                 load_item_master_pending.clear()
+                st.session_state["_toast"] = (f"Took back the staged {action_label.lower()} of {upc}. Nothing was changed.", "")
                 st.rerun()
 
     included_upcs = [upc for upc in pending if st.session_state.get(f"im_pending_include_{upc}", True)]
     left_out = len(pending) - len(included_upcs)
-    st.warning(f"Push makes the **{len(included_upcs):,}** included change(s) live right away"
-               + (f" ({left_out:,} left out stay staged)" if left_out else "") + ".")
-    confirm_push = st.checkbox(
-        "I've reviewed these changes and I'm ready to update the database.", key="confirm_push_item_master",
-    )
-    if st.button(
-        f"Push {len(included_upcs):,} Included Change(s) to the Database", type="primary",
-        key="push_item_master_pending", disabled=not confirm_push or not included_upcs,
-    ):
+    if included_upcs:
+        st.warning(f"Push makes the **{len(included_upcs):,}** included change(s) live right away"
+                   + (f" ({left_out:,} left out stay staged)" if left_out else "") + ".")
+    else:
+        st.info("Nothing is included in the next Push — tick Include on a change below to push it.")
+    if _push_confirm("I've reviewed these changes and I'm ready to update the database.", "confirm_push_item_master",
+                     f"Push {len(included_upcs):,} Included Change(s) to the Database", "push_item_master_pending",
+                     bool(included_upcs)):
         push_actor = st.session_state["name"]
         push_fns = {"add": push_item_master_add, "delete": push_item_master_delete}
         edits = {upc: pending[upc] for upc in included_upcs if pending[upc]["change_type"] == "edit"}
-        with st.spinner(f"Pushing {len(included_upcs):,} change(s)…"):
+        with st.spinner(f"Pushing {len(included_upcs):,} change(s)..."):
             dept_mapping.push_item_master_edits(ENGINE, edits, push_actor)
             for upc in included_upcs:
                 change = pending[upc]
@@ -2878,11 +3297,11 @@ def render_item_master_pending_section() -> dict:
             activity("Pushed live", "Pushed " + ", ".join(f"{n:,} item {'add' if k == 'add' else 'delete'}(s)" for k, n in n_types.items()),
                      ", ".join(u for u in included_upcs if pending[u]["change_type"] != "edit")[:500], sum(n_types.values()))
         load_item_master_pending.clear()
-        load_items.clear()
+        clear_items_cache(included_upcs)
         load_manual_items.clear()
         load_deleted_items.clear()
         st.session_state["_reset_confirm_push_item_master"] = True
-        st.success(f"Pushed {pushed_count:,} change(s) to the database.")
+        st.session_state["_toast"] = (f"Pushed {pushed_count:,} change(s) to the database.", "")
         st.rerun()
     st.divider()
     return pending
@@ -2901,8 +3320,9 @@ def source_pending_cross_link() -> dict:
     use (nothing to filter on there since the config grid is small, just
     a pointer to where to review/push/undo it)."""
     pending = load_source_pending_changes()
-    if pending:
-        st.caption(f"\U0001f4cb {len(pending):,} source change(s) staged, not yet pushed — see Pending Changes.")
+    # Always one line (so staging something doesn't push the page down).
+    st.caption(f"{len(pending):,} source change(s) staged, not yet pushed — see Pending Changes." if pending
+               else "Nothing staged yet — source changes you stage wait on Pending Changes until they're pushed.")
     return pending
 
 
@@ -2916,7 +3336,38 @@ def push_source_add(source_key: str, config: dict, actor: str) -> None:
         )
 
 
-def push_source_edit(source_key: str, config: dict, apply_now: bool, actor: str) -> str | None:
+def source_file_mismatch(source_key: str, config: dict) -> tuple:
+    """(file name, [(what, column)]) — the columns these settings name that the
+    source's last uploaded file doesn't have ([] when they all match, or when
+    there's no stored file to check)."""
+    try:
+        upload = load_raw_upload(ENGINE, source_key)
+    except Exception:
+        return None, []
+    if upload is None:
+        return None, []
+    from itemmaster.ingest import missing_columns
+    return upload["filename"], missing_columns(upload["df"], {**config, "source_key": source_key})
+
+
+def push_source_edit(source_key: str, config: dict, apply_now: bool, actor: str) -> tuple:
+    """Returns (pushed, message). With Apply Now, settings that don't fit the
+    source's last file aren't pushed at all (they'd only fail) — the change
+    stays staged; without it they're saved, with a warning."""
+    fname, missing = source_file_mismatch(source_key, config)
+    cols = ", ".join(f"{what} (“{col}”)" for what, col in missing)
+    if apply_now and missing:
+        return False, (f"{source_key}: not pushed — its last file ({fname}) has no {cols} column, so re-running it "
+                       "with these settings can't work. It's still on Pending Changes: fix the column names, or "
+                       "untick Apply immediately to save the settings for the next file only.")
+    warning = push_source_edit_apply(source_key, config, apply_now, actor)
+    if missing and not warning:
+        warning = (f"{source_key}: settings saved. Its last file ({fname}) has no {cols} column — the next file "
+                   "you upload for it needs those, or it'll be rejected.")
+    return True, warning
+
+
+def push_source_edit_apply(source_key: str, config: dict, apply_now: bool, actor: str) -> str | None:
     """Applies the config unconditionally, then — if apply_now — tries to
     re-run ingestion against the last uploaded file. The config update
     always succeeds or fails on its own; a bad new mapping (e.g. a
@@ -2947,6 +3398,7 @@ def push_source_edit(source_key: str, config: dict, apply_now: bool, actor: str)
             stage_source(
                 ENGINE, source_key, cleaned_df, rejected_df, stats,
                 uploaded_by=actor, original_filename=upload["filename"], on_retry=_warn_retrying,
+                new_file=False,  # the same file, re-read with the new settings
             )
             load_raw_item_counts.clear()
             load_ingestion_log.clear()
@@ -2998,7 +3450,7 @@ def render_source_pending_section() -> dict:
                 live_config = live_by_key.get(source_key, {})
                 diffs = diff_pending_fields(live_config, change, dept_mapping.SOURCE_CONFIG_COLUMNS, SOURCE_FIELD_LABELS)
                 if diffs:
-                    c1.caption("Changing: " + ", ".join(d[0] for d in diffs))
+                    c1.markdown(diffs_inline(diffs))
                 elif change["apply_now"]:
                     c1.caption("No configuration fields changed — Apply Now will re-run ingestion as-is.")
                 else:
@@ -3013,8 +3465,9 @@ def render_source_pending_section() -> dict:
                     dept_mapping.set_source_pending_apply_now(ENGINE, source_key, new_apply_now)
                     load_source_pending_changes.clear()
                     st.rerun()
-                with st.expander(f"Full details ({len(diffs)} field(s) changing)", key=f"source_pending_expander_{source_key}"):
-                    render_pending_field_table(diffs, ["Field", "Current", "Staged"])
+                if len(diffs) > 3:
+                    with st.expander(f"Full details ({len(diffs)} field(s) changing)", key=f"source_pending_expander_{source_key}"):
+                        render_pending_field_table(diffs, ["Field", "Current", "Staged"])
             else:
                 rows = [(SOURCE_FIELD_LABELS.get(col, col), _format_pending_value(change[col])) for col in dept_mapping.SOURCE_CONFIG_COLUMNS if not _is_blank(change[col])]
                 with st.expander("Full details", key=f"source_pending_expander_{source_key}"):
@@ -3023,34 +3476,34 @@ def render_source_pending_section() -> dict:
                 dept_mapping.delete_source_pending_change(ENGINE, source_key)
                 activity("Sources", f"Took back a staged source {'add' if change['change_type'] == 'add' else 'edit'}", source_key)
                 load_source_pending_changes.clear()
+                st.session_state["_toast"] = (f"Took back the staged change to {source_key}. Nothing was changed.", "")
                 st.rerun()
     st.warning(f"Push makes all **{len(pending):,}** staged source change(s) live right away.")
-    confirm_push = st.checkbox(
-        "I've reviewed these source changes and I'm ready to update the database.",
-        key="confirm_push_source_changes",
-    )
-    if st.button(
-        f"Push {len(pending):,} Source Change(s) to the Database", type="primary",
-        key="push_source_pending", disabled=not confirm_push,
-    ):
+    if _push_confirm("I've reviewed these source changes and I'm ready to update the database.",
+                     "confirm_push_source_changes", f"Push {len(pending):,} Source Change(s) to the Database",
+                     "push_source_pending", True):
         push_actor = st.session_state["name"]
         rerun_warnings = []
         applied_now_sources = []
+        held_back = []
         for source_key, change in pending.items():
             config = {col: change[col] for col in dept_mapping.SOURCE_CONFIG_COLUMNS}
             if change["change_type"] == "add":
                 push_source_add(source_key, config, push_actor)
             else:
-                warning = push_source_edit(source_key, config, change["apply_now"], push_actor)
+                pushed, warning = push_source_edit(source_key, config, change["apply_now"], push_actor)
                 if warning:
                     rerun_warnings.append(warning)
-                elif change["apply_now"]:
+                if not pushed:
+                    held_back.append(source_key)
+                    continue
+                if not warning and change["apply_now"]:
                     applied_now_sources.append(source_key)
             dept_mapping.delete_source_pending_change(ENGINE, source_key)
             activity("Pushed live", ("Pushed a new source" if change["change_type"] == "add" else "Pushed a source edit")
                      + (" (re-ran its last file)" if change.get("apply_now") and change["change_type"] != "add" else "")
                      + f" (staged by {change.get('staged_by') or '?'})", source_key)
-        pushed_count = len(pending)
+        pushed_count = len(pending) - len(held_back)
         load_sources.clear()
         load_source_pending_changes.clear()
         load_stale_sources.clear()
@@ -3058,7 +3511,8 @@ def render_source_pending_section() -> dict:
         st.session_state["_reset_confirm_push_source_changes"] = True
         if rerun_warnings:
             st.session_state["_source_push_warnings"] = rerun_warnings
-        st.success(f"Pushed {pushed_count:,} source change(s) to the database.")
+        st.session_state["_toast"] = (f"Pushed {pushed_count:,} source change(s) to the database."
+                                      + (f" {len(held_back)} held back — see the note above." if held_back else ""), "")
         # Apply Now already refreshed raw_items for these sources — auto-
         # recompute a fresh merge draft right now instead of leaving that
         # new data invisible until a separate, easy-to-forget trip to the
@@ -3228,8 +3682,11 @@ def _workbench_body(key: str, items: pd.DataFrame, options: list, *, value_label
                           help="Blank out every row in this grid (not just the ones the filter shows). Undo brings them back.")
     fill_btn = t5.empty()
 
+    grid = view[["✓", value_label] + [c for c in info_cols if c in view.columns]].copy()
+    for c in [c for c in info_cols if c in grid.columns]:  # read-only: blank reads as blank, not "None"
+        grid[c] = grid[c].astype(object).where(grid[c].notna(), "")
     edited = st.data_editor(
-        view[["✓", value_label] + [c for c in info_cols if c in view.columns]],
+        grid,
         key=f"wb_grid_{key}_{v}", hide_index=True, width='stretch',
         height=min(640, 38 + 35 * max(len(view), 1)),
         disabled=[c for c in info_cols],
@@ -3444,7 +3901,7 @@ def render_group_excel(grids: list, options: list, file_stem: str, title: str, s
             st.caption("Nothing left in this group.")
             return
         out = pd.DataFrame(rows)
-        st.download_button("Download as Excel", _excel_with_dropdown(out, "Department", [USE_AUTO] + options),
+        st.download_button("Download as Excel", partial(_excel_with_dropdown, out, "Department", [USE_AUTO] + options),  # built on click
                            file_name=f"{file_stem}.xlsx", key=f"grp_dl_{file_stem}",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         ver = st.session_state.get(f"_grp_up_ver_{file_stem}", 0)
@@ -3469,7 +3926,7 @@ def render_group_excel(grids: list, options: list, file_stem: str, title: str, s
         try:
             df = pd.read_csv(up, dtype=str) if up.name.lower().endswith(".csv") else pd.read_excel(up, dtype=str)
         except Exception as e:
-            st.error(f"Couldn't read that file: {e}")
+            st.error(item_bulk.describe_read_error(up.name, e))
             return
         cols = {c.strip().lower(): c for c in df.columns}
         if "upc" not in cols or "department" not in cols:
@@ -3543,8 +4000,27 @@ def open_dept_dialog(key: str, info: dict) -> None:
         st.rerun()  # (from a button's on_click there's no need: the click's own run opens it)
 
 
+def dept_rerun(catch_up: bool = True) -> None:
+    """After an action inside a Department Review section: re-run just that
+    section (fast) and let the rest of the page catch up quietly a moment
+    later (see _dr_catch_up). catch_up=False for an action nothing else on
+    the page shows (opening / releasing a Broken Out group), so no second,
+    whole-page rebuild follows. Outside a section's own run it's a normal
+    full re-run."""
+    if _only_fragments_running():
+        if catch_up:
+            st.session_state["_dept_dirty"] = True
+        st.rerun(scope="fragment")
+    st.rerun()
+
+
 def show_dept_dialog() -> bool:
-    """Shows whichever Department Review popup is open (one per run)."""
+    """Shows whichever Department Review popup is open — once per run, however
+    many places ask (a popup button, the top bar, the Department Review tab)."""
+    if globals().get("_DEPT_DIALOG_SHOWN"):
+        return True
+    if any(st.session_state.get(k) is not None for k in DEPT_DIALOG_KEYS):
+        globals()["_DEPT_DIALOG_SHOWN"] = True
     if st.session_state.get("dept_confirm_send_back") is not None:
         confirm_send_back_dialog()
     elif st.session_state.get("dept_confirm_break_out") is not None:
@@ -3563,6 +4039,11 @@ def show_dept_dialog() -> bool:
     return True
 
 
+def _only_fragments_running() -> bool:
+    ctx = _get_ctx() if "_get_ctx" in globals() else None
+    return bool(ctx is not None and getattr(ctx, "fragment_ids_this_run", None))
+
+
 @st.fragment
 def _popup_button_frag(label: str, key: str, on_press, kw: dict) -> None:
     if st.button(label, key=key, **kw):
@@ -3571,6 +4052,8 @@ def _popup_button_frag(label: str, key: str, on_press, kw: dict) -> None:
             on_press()  # sets up the popup (see open_dept_dialog)
         finally:
             st.session_state.pop("_dialog_from_click", None)
+        if _only_fragments_running():  # a button-only run: the top of the app (which resets it) didn't run
+            globals()["_DEPT_DIALOG_SHOWN"] = False
         show_dept_dialog()
 
 
@@ -3579,6 +4062,20 @@ def popup_button(container, label: str, key: str, on_press, **kw) -> None:
     page: only this button reruns, and the popup opens in that same run.
     on_press must not depend on loop variables (bind them: functools.partial)."""
     kw.setdefault("width", "stretch")
+    if _IN_DR_SECTION:
+        # Inside a Department Review section, which is already its own
+        # fragment: a plain button re-runs just that section and opens the
+        # popup there (a fragment per button would cost ~15 ms each to set up).
+        if container.button(label, key=key, **kw):
+            st.session_state["_dialog_from_click"] = True
+            try:
+                on_press()
+            finally:
+                st.session_state.pop("_dialog_from_click", None)
+            if _only_fragments_running():
+                globals()["_DEPT_DIALOG_SHOWN"] = False
+            show_dept_dialog()
+        return
     with container:
         _popup_button_frag(label, key, on_press, kw)
 
@@ -3645,7 +4142,7 @@ def admin_override_dialog():
         locked_by = change.get("overridden_by") if change else None
         current = change["department"] if change else None
         if locked_by:
-            st.caption(f"Locked by **{locked_by}**'s override at **{current}**. Change it, or unlock it for normal editing.")
+            st.caption(f"Locked by **{locked_by}**'s override to **{current}**. Change it, or unlock it for normal editing.")
         else:
             st.caption(
                 "Forces this decision to ANY department immediately, regardless of who's backing it or "
@@ -3656,6 +4153,7 @@ def admin_override_dialog():
         c1, c2, c3 = st.columns(3)
         if c3.button("Cancel", width='stretch', key="admin_override_cancel_combo"):
             st.session_state.pop("dept_admin_override", None)
+            st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
             st.rerun()
         if c1.button("Update override" if locked_by else "Override", type="primary", width='stretch', disabled=dept == current):
             with track(combo_id, info["label"], f"Admin override → {dept}"):
@@ -3697,6 +4195,7 @@ def admin_override_dialog():
         a1, a2 = st.columns(2)
         if a2.button("Cancel", width='stretch', key="admin_override_cancel_group"):
             st.session_state.pop("dept_admin_override", None)
+            st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
             st.rerun()
         if a1.button(
             f"Apply ({len(to_override)} override(s), {len(to_unlock)} unlock(s))", type="primary",
@@ -3746,9 +4245,11 @@ def undo_picker_dialog():
 
     seen_key = f"_undo_seen_{combo_id}"
 
-    def _close():
+    def _close(changed: bool = False):
         st.session_state.pop("dept_undo_picker", None)
         st.session_state.pop(seen_key, None)
+        if not changed:
+            st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
         st.rerun()
 
     st.markdown(f"**{info['label']}**")
@@ -3761,9 +4262,16 @@ def undo_picker_dialog():
     if path["staged"]["combo_decision"]:
         staged_bits.append(f"the staged decision {path['staged']['combo_decision']}")
     if path["staged"]["combo_votes"]:
-        staged_bits.append(f"{path['staged']['combo_votes']} dispute vote(s)")
+        staged_bits.append(f"{path['staged']['combo_votes']} vote(s) on it")  # (agreements and suggestions)
     if path["staged"]["upc_items"]:
-        staged_bits.append(f"{path['staged']['upc_items']:,} staged item decision(s)")
+        # Say where they came from when it's the old-workbook import (that's
+        # staged work, not a move: taking it back leaves the group where it is).
+        n_import = sum(1 for c in load_dept_pending_upc_changes().values()
+                       if c["combo_id"] == combo_id and str(c.get("origin_note") or "").startswith(old_workbook_import.NOTE_PREFIX))
+        n_items = path["staged"]["upc_items"]
+        staged_bits.append(f"{n_items:,} staged item decision(s)" + (
+            "" if not n_import else " from the old-workbook import" if n_import == n_items
+            else f" ({n_import:,} from the old-workbook import)"))
     if path["staged"]["upc_suggestions"]:
         staged_bits.append(f"{path['staged']['upc_suggestions']:,} item suggestion(s)")
     staged_text = ("discards " + ", ".join(staged_bits)) if staged_bits else ""
@@ -3777,14 +4285,14 @@ def undo_picker_dialog():
     # what it lands on and exactly what it throws away, with its own button.
     options = []
     if path["has_staged"]:
-        options.append((path["current"], 0, staged_text))
+        # It stays where it is; only the staged work goes.
+        options.append((f"Take back the staged work — it stays in {path['current']}", path["current"], 0, staged_text))
     undone = []
     for i, m in enumerate(path["moves"]):
-        when = pd.to_datetime(m["created_at"], errors="coerce")
-        when = when.strftime("%m/%d %H:%M") if pd.notna(when) else ""
+        when = local_time(m["created_at"])  # (local time, like the rest of the page)
         undone.append(f"{m['description']} ({m['created_by']}" + (f", {when}" if when else "") + ")")
         what = " · ".join(b for b in (staged_text, "undoes " + " and ".join(undone)) if b)
-        options.append((m["before"], i + 1, what))
+        options.append((f"Back to {m['before']}", m["before"], i + 1, what))
     if not options:
         st.info("Nothing to undo — nothing is staged on this group and it has no unpushed moves.")
         if st.button("Close"):
@@ -3794,53 +4302,51 @@ def undo_picker_dialog():
     # What this popup showed the LAST time it was drawn — i.e. what the
     # person actually looked at before clicking. The undo only runs if the
     # group is still exactly that (see undo_combo_to_stage).
-    now_seen = (
-        [m["move_id"] for m in path["moves"]],
-        dept_mapping._redo_state_key(dept_mapping.get_combo_snapshot(ENGINE, combo_id)),
-    )
+    current_snap = dept_mapping.get_combo_snapshot(ENGINE, combo_id)
+    now_seen = ([m["move_id"] for m in path["moves"]], dept_mapping._redo_state_key(current_snap))
     seen = st.session_state.get(seen_key) or now_seen
     st.session_state[seen_key] = now_seen
 
     can_execute = is_admin or not path["has_staged"] or actor == path["authorized"]
-    st.caption("Undo back to:" if can_execute else "Points this can be undone back to:")
-    current_snap = dept_mapping.get_combo_snapshot(ENGINE, combo_id)
-    for i, (target, n_moves, what) in enumerate(options):
+    st.caption("Choose what to undo:" if can_execute else "Points this can be undone back to:")
+    for i, (title, target, n_moves, what) in enumerate(options):
         snap = current_snap if n_moves == 0 else path["moves"][n_moves - 1]["snapshot"]
         c1, c2 = st.columns([4, 1.1], vertical_alignment="center")
-        c1.markdown(f"**{target}**")
+        c1.markdown(f"**{title}**")
         c1.caption(what[:1].upper() + what[1:])
         auto_mode = "as_was"
         if can_execute and (snap.get("combo") or {}).get("decision_state") in ("broken_out", "decided_broken_out"):
             # Landing in Broken Out: same choice as a Break Out — keep the
             # automatic item decisions it had, re-run auto-matching, or none.
-            hk = f"_undo_hits_{combo_id}"
-            if hk not in st.session_state:
-                with st.spinner("Checking what auto-matching can decide..."):
-                    st.session_state[hk] = dept_mapping.compute_upc_decisions_for_combo(ENGINE, combo_id, ignore_own=True)
+            # (Re-running is only worked out if picked, on Confirm, so the
+            # popup opens straight away.)
             n_auto, n_people = dept_mapping.auto_counts(snap.get("overrides"))
             # a "stay" point (n_moves 0) discards the staged work anyway
             n_staged = 0 if n_moves == 0 else len((snap.get("staged") or {}).get("dept_mapping_pending_upc_changes") or [])
-            n_hits = len(st.session_state[hk])
             kept = [f"{n_staged:,} staged decision(s)"] if n_staged else []
             kept += [f"{n_auto:,} auto-matched"] if n_auto else []
             kept += [f"{n_people:,} decided earlier"] if n_people else []
-            choices = {"as_was": "Everything as it was" + (f" — {', '.join(kept)}" if kept else "")}
+            if n_moves == 0:
+                choices = {"as_was": f"Keep the rest — {', '.join(kept)}" if kept else "Keep the rest"}
+            else:
+                choices = {"as_was": "Everything as it was" + (f" — {', '.join(kept)}" if kept else "")}
             if n_staged and n_auto:
                 choices["auto_only"] = f"Only the auto-matched ({n_auto:,}) — drop the staged decisions"
-            if n_hits and n_hits != n_auto:
-                choices["rerun"] = f"Re-run auto-matching now ({n_hits:,})" + (" — drop the staged decisions" if n_staged else "")
+            if n_auto or n_moves:
+                choices["rerun"] = "Re-run auto-matching fresh" + (" — drop the staged decisions" if n_staged else "")
             if kept:
                 choices["blank"] = "All blank — every item undecided"
             if len(choices) > 1:
                 auto_mode = c1.radio(
-                    "Bring back", list(choices), format_func=choices.get, key=f"undo_auto_{combo_id}_{n_moves}",
-                    help="Everything as it was: every item decision the group had — staged ones included — exactly. "
-                         "Only the auto-matched: just what auto-matching filled in. All blank: start the group over.",
+                    "Its items" if n_moves == 0 else "Bring back", list(choices), format_func=choices.get,
+                    key=f"undo_auto_{combo_id}_{n_moves}",
+                    help="Keep / Everything as it was: every other item decision stays exactly. "
+                         "Re-run: auto-matching fills in the items again from today's data. All blank: start the group over.",
                 )
         if can_execute and c2.button("Confirm undo", key=f"undo_to_{combo_id}_{n_moves}", width='stretch',
                                      type="primary" if i == 0 else "secondary"):
-            with st.spinner("Undoing..."):
-                with track(combo_id, info["label"], f"Undid to {target.removeprefix('Stay in ')}"
+            with st.spinner("Undoing and re-running auto-matching..." if auto_mode == "rerun" else "Undoing..."):
+                with track(combo_id, info["label"], f"Undid to {target}"
                            + {"as_was": "", "auto_only": " (auto-matched only)", "rerun": " (auto-matching re-run)",
                               "blank": " (all items blank)"}[auto_mode]):
                     ok = dept_mapping.undo_combo_to_stage(
@@ -3861,8 +4367,9 @@ def undo_picker_dialog():
             load_broken_out_claims.clear()
             clear_dept_suggestion_caches()
             clear_dept_review_caches()
-            st.session_state["_toast"] = (f"Undone: **{info['label']}** — now {target.removeprefix('Stay in ')}.", "")
-            _close()
+            st.session_state["_toast"] = ((f"Took back the staged work on **{info['label']}** — still in {target}." if n_moves == 0
+                                           else f"Undone: **{info['label']}** — now {target}."), "")
+            _close(changed=True)
 
     if not can_execute:
         st.info(
@@ -3876,7 +4383,7 @@ def undo_picker_dialog():
                 dept_mapping.request_undo_upc_group_all(ENGINE, combo_id, actor, is_admin=False)
             clear_dept_suggestion_caches()
             st.session_state["_toast"] = (f"Asked **{path['authorized']}** to undo **{info['label']}**.", "")
-            _close()
+            _close(changed=True)
 
 
 def summarize_combo_decisions(combo_id: int) -> list:
@@ -3950,6 +4457,7 @@ def confirm_send_back_dialog():
         )
     if c2.button("Cancel", width='stretch'):
         st.session_state.pop("dept_confirm_send_back", None)
+        st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
         st.rerun()
 
 
@@ -3973,7 +4481,7 @@ def request_send_back(
 def perform_break_out(
     combo_id: int, source_key: str, label: str, n_upcs_total: int, upc_decisions: dict, reopen: bool = False,
 ) -> None:
-    with st.spinner(f"Breaking out {n_upcs_total:,} item(s)…"), track(
+    with st.spinner(f"Breaking out {n_upcs_total:,} item(s)..."), track(
         combo_id, f"{source_key.upper()} — {label}", "Sent back to Broken Out" if reopen else "Broke out to item level",
     ):
         snapshot = dept_mapping.get_combo_snapshot(ENGINE, combo_id)
@@ -4026,6 +4534,7 @@ def _break_out_dialog_body():
 
     def _cancel():
         st.session_state.pop("dept_confirm_break_out", None)
+        st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
         st.rerun()
 
     action = "Send it back" if reopen else "Break it out"
@@ -4094,8 +4603,7 @@ def request_break_out(
     first, and when there ARE hits, asks which starting point to use
     instead of silently picking one."""
     with st.spinner(
-        "Checking which items can be auto-matched (Brand / UPC Root / Description)… "
-        "the first check after new data is loaded can take up to ~15 seconds."
+        "Checking which items can be auto-matched (Brand, UPC root, Description)..."
     ):
         upc_decisions = (
             {} if fully_auto else dept_mapping.compute_upc_decisions_for_combo(ENGINE, combo_id, ignore_own=reopen)
@@ -4180,13 +4688,130 @@ def _notif_since() -> "datetime":
 
 def _open_notification(tab: str, search: str) -> None:
     # A button callback runs before any widget is drawn, so the tab
-    # selectors and search box can be set here directly.
+    # selectors and search box can be set here directly. (A button inside a
+    # part of the page that re-runs on its own asks for the whole page — see _dr_section.)
+    st.session_state["_full_rerun"] = True
     st.session_state["active_tab"] = "Department Review"
     st.session_state["dept_review_subtab"] = tab
+    st.query_params["sub"] = tab  # (the address follows: a reload stays here)
+    st.session_state["_dr_default"] = None  # (re-open the tabs on it even if it was already the default)
     get_shared_dept_filter()["search"] = search
     tab_key = {"Pending Changes": "pending_changes", "Decided": "decided", "Broken Out": "broken_out"}.get(tab)
     if tab_key:
         get_dept_tab_filters()[tab_key] = {"search": search}
+
+
+JUMP_TAB_KEYS = {"Crosswalk": "dept_review_review", "Unmatched": "dept_review_unmatched", "Broken Out": "broken_out"}
+
+
+def _jump_to_group(section: str, combo_id: int, label: str) -> None:
+    """A shortcut's button: opens Department Review on that group's section,
+    with that section's filters cleared so the group is on the list, at the
+    page it's on — and the group itself scrolled to and outlined. (A whole-page
+    rerun follows: the button can sit in a part of the page that re-runs on its own.)"""
+    st.session_state["_nav_to_tab"] = "Department Review"
+    st.session_state["dept_review_subtab"] = section
+    st.query_params["sub"] = section  # (the address follows: a reload stays here)
+    st.session_state["_dr_default"] = None  # (re-open the tabs on it even if it was already the default)
+    tab_key = JUMP_TAB_KEYS.get(section)
+    if tab_key:
+        get_shared_dept_filter()["search"] = ""
+        own = get_dept_tab_filters().get(tab_key)
+        if own:
+            own["search"] = ""
+        get_dept_facets(tab_key).clear()
+        st.session_state["_jump_group"] = (section, int(combo_id))
+        if section == "Broken Out":
+            st.session_state["_url_group"] = int(combo_id)
+    else:  # (staged already: Pending Changes, found by its name)
+        get_shared_dept_filter()["search"] = label
+        get_dept_tab_filters()["pending_changes"] = {"search": label}
+
+
+def _jump_page(section: str, filtered: pd.DataFrame, page_num_key: str, tab_key: str):
+    """If a shortcut is opening a group in this section: put the list on the
+    page that group is on. Returns the group's id (to outline it) or None."""
+    jump = st.session_state.get("_jump_group")
+    if not jump or jump[0] != section:
+        return None
+    st.session_state.pop("_jump_group", None)
+    ids = list(filtered["combo_id"].astype(int))
+    if jump[1] not in ids:
+        st.info("That group isn't waiting here any more — someone may have decided it already.")
+        return None
+    size = st.session_state.get(_dept_filter_keys(tab_key)[3]) or DEFAULT_GROUP_PAGE_SIZE
+    st.session_state[page_num_key] = ids.index(jump[1]) // size + 1
+    return jump[1]
+
+
+def _outline_card(card_key: str) -> None:
+    """Scroll to a group's card and outline it for a moment (the shortcut's landing)."""
+    st.html("""<script>
+(() => {
+  let n = 0;
+  const go = () => {
+    const el = document.querySelector('.st-key-CARD');
+    if (!el || !el.offsetParent || document.body.dataset.tabSwitch) { if (n++ < 200) setTimeout(go, 120); return; }
+    el.scrollIntoView({behavior: "instant", block: "center"});
+    el.classList.add("app-jump-target");
+    setTimeout(() => el.classList.remove("app-jump-target"), 6000);
+  };
+  go();
+})();
+</script>""".replace("CARD", card_key), unsafe_allow_javascript=True)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_needs_decision(upcs: tuple) -> pd.DataFrame:
+    return dept_mapping.needs_decision(ENGINE, list(upcs))
+
+
+def render_needs_decision(upcs, key: str) -> None:
+    """New items still waiting on a person for their Department — one line per
+    group, each with a button straight to that group on Department Review.
+    Items that joined a decided group, or that a match decided, aren't listed."""
+    if not len(upcs) or not is_reviewer:
+        return
+    need = load_needs_decision(tuple(sorted(set(upcs))))
+    if need.empty:
+        st.success("Every new item has its Department — each joined a decided group or was decided by a match.")
+        return
+    staged = need["section"] == "Pending Changes"
+    n, n_staged = int(need.loc[~staged, "n_items"].sum()), int(need.loc[staged, "n_items"].sum())
+    names = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    with st.container(border=True, key=f"needs_dec_{key}"):
+        head = (f"**{n:,} new item(s) need a Department decision** · in {int((~staged).sum()):,} group(s)" if n
+                else "**Every new item has a decision**")
+        if n_staged:
+            head += f" · {n_staged:,} more staged, waiting on Push"
+        st.markdown(head)
+        n_fine = len(set(upcs)) - n - n_staged
+        if n_fine > 0:
+            st.caption(f"The other {n_fine:,} joined a decided group or were decided by an item match, so they need nothing.")
+        for _, r in need.head(25).iterrows():
+            c1, c2 = st.columns([5, 1.4], vertical_alignment="center")
+            where = {"Pending Changes": "staged on Pending Changes, waiting on Push"}.get(r["section"], r["section"])
+            c1.markdown(f"**{names.get(r['source_key']) or r['source_key']}** — {r['label']}  \n"
+                        f":gray[{where} · {int(r['n_items']):,} new item(s)]")
+            if c2.button("Open group →", key=f"needs_dec_{key}_{r['combo_id']}", width='stretch',
+                         help=f"Open this group on Department Review → {r['section']}"):
+                _jump_to_group(r["section"], int(r["combo_id"]), r["label"])
+                st.rerun()  # (the whole page, from inside a fragment too)
+        if len(need) > 25:
+            st.caption(f"…and {len(need) - 25:,} more group(s), on Department Review.")
+
+
+def _push_confirm(confirm_label: str, confirm_key: str, button_label: str, button_key: str, ok: bool) -> bool:
+    """The "I've reviewed…" tick and its Push button, in a form: ticking happens
+    in the browser (no server run, so it's instant), and Push sends both at once.
+    Returns True when Push was pressed with the box ticked."""
+    with st.form(f"{button_key}_form", border=False, enter_to_submit=False):
+        confirm = st.checkbox(confirm_label, key=confirm_key)
+        pressed = st.form_submit_button(button_label, type="primary", key=button_key, disabled=not ok)
+    if pressed and not confirm:
+        st.toast("Tick “I've reviewed…” first, then Push.")
+        return False
+    return pressed
 
 
 def _mark_all_read() -> None:
@@ -4245,20 +4870,23 @@ def render_notifications_sidebar() -> None:
     not fifty. Admins can also see everyone else's, one person at a time."""
     name = st.session_state["name"]
     since = _notif_since()
-    notes = load_notifications(name, since, is_admin)
+    notes = _without_dismissed(load_notifications(name, since, is_admin))
     n_new = sum(1 for n in notes["action"] + notes["updates"] if n["new"])
     kinds = dept_mapping.NOTIFICATION_KINDS
 
-    def _row(n, key):
+    def _row(n, key, mine=True):
         badge = ":blue[New] · " if n["new"] else ""
-        c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+        c1, c2, c3 = st.columns([4, 1.3, 0.55] if mine else [4, 1.3, 0.01], vertical_alignment="center")
         c1.markdown(f"{badge}**{n['title']}**  \n:gray[{n['detail']}]")
         c2.button("Open", key=key, width='stretch', help=f"Open it on {n['tab']}",
                   on_click=_open_notification, args=(n["tab"], n["search"]))
+        if mine:
+            c3.button("✕", key=f"{key}_x", width='stretch', help="Dismiss — don't show this one again",
+                      on_click=_dismiss_notes, args=([n],), type="tertiary")
 
     def _card(n, key):
         with st.container(border=True):
-            _row(n, key)
+            _row(n, key, mine=not key.startswith("notif_team_"))
 
     def _rollup(kind, items, key):
         n_new_here = sum(1 for n in items if n["new"])
@@ -4268,7 +4896,10 @@ def render_notifications_sidebar() -> None:
             st.caption(items[0]["detail"] + (" · and more" if len(items) > 1 else ""))
             with st.expander("Show them"):
                 for i, n in enumerate(items):
-                    _row(n, f"{key}_{i}")
+                    _row(n, f"{key}_{i}", mine=not key.startswith("notif_team_"))
+            if not key.startswith("notif_team_"):
+                st.button(f"Dismiss these {len(items)}", key=f"{key}_x", type="tertiary",
+                          on_click=_dismiss_notes, args=(items,))
 
     def _section(title, items, empty, key):
         st.markdown(f"**{title}**" + (f" ({len(items)})" if items else ""))
@@ -4369,8 +5000,7 @@ def next_step(name: str) -> dict:
 
 
 def _topbar_step(kind: str) -> None:
-    # Opens the confirm popup; the popup lives in the Department Review tab.
-    st.session_state["active_tab"] = "Department Review"
+    # Opens the confirm popup right where you are (see popup_button).
     for k in DEPT_DIALOG_KEYS:
         st.session_state.pop(k, None)
     st.session_state["dept_topbar_step"] = {"kind": kind}
@@ -4389,8 +5019,10 @@ def topbar_step_dialog():
     name = st.session_state["name"]
     target = next_step(name)["undo" if undo else "redo"]
 
-    def _close():
+    def _close(changed: bool = False):
         st.session_state.pop("dept_topbar_step", None)
+        if not changed:
+            st.session_state["_quiet_run"] = True  # closing a popup changes nothing on the page
         st.rerun()
 
     if not target:
@@ -4420,7 +5052,7 @@ def topbar_step_dialog():
             st.session_state.setdefault(dst, []).append(entry)
             st.session_state["_toast"] = (f"{'Undone' if undo else 'Redone'}: {entry['label']} — **{entry['where']}**.",
                                           "" if undo else "")
-            _close()
+            _close(changed=True)
         if c2.button("Cancel", width='stretch'):
             _close()
         return
@@ -4457,13 +5089,30 @@ def topbar_step_dialog():
                 f"Nothing was changed; that step is skipped{' and your next Undo goes to the one before it' if undo else ''}.",
                 "",
             )
-        _close()
+        _close(changed=True)
     if c2.button("Cancel", width='stretch'):
         _close()
 
 
-def _toggle_notifications() -> None:
-    st.session_state["_show_notifications"] = not st.session_state.get("_show_notifications", True)
+def _my_dismissed() -> set:
+    """The notifications this person dismissed (read once per session, kept up to date here)."""
+    name = st.session_state["name"]
+    per_user = st.session_state.setdefault("_notif_dismissed", {})
+    if name not in per_user:
+        per_user[name] = dept_mapping.dismissed_notes(ENGINE, name)
+    return per_user[name]
+
+
+def _without_dismissed(notes: dict) -> dict:
+    gone = _my_dismissed()
+    return {k: ([n for n in v if dept_mapping.note_key(n) not in gone] if k in ("action", "updates") else v)
+            for k, v in notes.items()}
+
+
+def _dismiss_notes(items: list) -> None:
+    keys = [dept_mapping.note_key(n) for n in items]
+    dept_mapping.dismiss_notes(ENGINE, st.session_state["name"], keys)
+    _my_dismissed().update(keys)
 
 
 def _on_logout(_info=None) -> None:
@@ -4509,6 +5158,8 @@ def render_topbar() -> None:
                 width: fit-content !important;
             }
             div.st-key-topbar button { min-height: 2rem; padding: 0.1rem 0.7rem; }
+            div.st-key-topbar button p { white-space: nowrap; }
+            div.st-key-topbar [data-testid="stLayoutWrapper"] { width: auto !important; flex: 0 0 auto; }
             body:has(section[data-testid="stSidebar"][aria-expanded="true"]) div.st-key-topbar {
                 left: calc(300px + 1rem);
             }
@@ -4518,30 +5169,27 @@ def render_topbar() -> None:
         )
         if is_reviewer:
             name = st.session_state["name"]
-            peek = next_step(name)
-            u, r = peek["undo"], peek["redo"]
-            describe = lambda t: (f"{t['label']} — {t['where']} (grid, not staged)" if t["draft"]
-                                  else f"{t['description']} — {t['label']}")
-            notes = load_notifications(name, _notif_since(), is_admin)
+            notes = _without_dismissed(load_notifications(name, _notif_since(), is_admin))
             n_new = sum(1 for n in notes["action"] + notes["updates"] if n["new"])
             if is_admin:
                 n_new += len(load_app_errors())
-            showing = st.session_state.get("_show_notifications", True)
+            # Opens the sidebar where the notifications are (the page script does it, right in the
+            # browser); it never hides them — each one is dismissed on its own.
             st.button(
-                f"🔔 {n_new}" if n_new else "🔔", key="topbar_bell", on_click=_toggle_notifications,
-                type="primary" if n_new else "secondary",
-                help=("Hide" if showing else "Show") + " notifications (in the sidebar — open it with >>)",
+                f"🔔 {n_new}" if n_new else "🔔", key="topbar_bell",
+                type="primary" if n_new else "secondary", help="Notifications",
             )
-            st.button(
-                "Undo", key="topbar_undo", on_click=_topbar_step, args=("undo",),
-                help=(f"Undo: {describe(u)}" if u else "Nothing of yours to undo")
-                + ". Department Review actions and grid work — not Merge pushes or anything already pushed live.",
+            popup_button(
+                st.container(), "Undo", "topbar_undo", partial(_topbar_step, "undo"), width="content",
             )
-            st.button(
-                "Redo", key="topbar_redo", on_click=_topbar_step, args=("redo",),
-                help=(f"Redo: {describe(r)}" if r else "Nothing to redo")
-                + ". Only if nobody has changed that group since your undo.",
+            popup_button(
+                st.container(), "Redo", "topbar_redo", partial(_topbar_step, "redo"), width="content",
             )
+            # The Undo / Redo popup stays open on whichever tab you're on (on
+            # Department Review, that tab shows it with its other popups).
+            if (st.session_state.get("dept_topbar_step") is not None
+                    and st.session_state.get("active_tab") != "Department Review"):
+                show_dept_dialog()
 
 
 def render_account_box() -> None:
@@ -4565,7 +5213,12 @@ def _data_version() -> dict:
 def refresh_if_changed_elsewhere() -> None:
     """Changes made in the app clear the shared caches right away; changes
     made outside it (the scheduled monthly refresh, a script) don't. One
-    cheap query per click spots those and refreshes the cached lists."""
+    cheap query spots those and refreshes the cached lists — at most every
+    10 seconds per person, so ordinary clicks don't wait on it."""
+    now = time.monotonic()
+    if now - st.session_state.get("_changed_elsewhere_checked", -1e9) < 10:
+        return
+    st.session_state["_changed_elsewhere_checked"] = now
     try:
         with db_connect() as conn:
             fp = tuple(conn.execute(text(
@@ -4600,17 +5253,18 @@ def refresh_if_changed_elsewhere() -> None:
 
 load_workspace()
 refresh_if_changed_elsewhere()
+_mark("workspace + changed-elsewhere check")
 render_account_box()
 if is_reviewer:
     render_topbar()
 st.title("NWG Item Master App")
 
-if is_reviewer and st.session_state.get("_show_notifications", True):
+if is_reviewer:
     render_notifications_sidebar()
 
 tab_names = ["Item Master"]
 if is_reviewer:
-    tab_names += ["Department Review", "Add Item", "Delete Item", "UPC Overrides", "Pending Changes"]
+    tab_names += ["Department Review", "Add Item", "Delete Item", "Upload Reports", "UPC Overrides", "Pending Changes"]
 if is_admin:
     tab_names += ["Sources", "Upload & Ingest", "Merge", "Snapshots"]
 if is_reviewer:
@@ -4660,6 +5314,7 @@ if not st.session_state.get("_url_seeded"):
 if "active_tab" not in st.session_state and st.query_params.get("tab") in tab_names:
     st.session_state["active_tab"] = st.query_params["tab"]
 active_tab = st.radio("Section", tab_names, horizontal=True, label_visibility="collapsed", key="active_tab")
+_mark("top bar, sidebar, tabs")
 
 # A one-shot corner popup (bottom-right, auto-fading) for actions that make
 # a row/group disappear from the list it was just acted on — staging a
@@ -4668,9 +5323,6 @@ active_tab = st.radio("Section", tab_names, horizontal=True, label_visibility="c
 # as "did that even work?". Callers set st.session_state["_toast"] =
 # (message, icon) right before st.rerun() instead of calling st.toast()
 # directly, so every such confirmation renders from this one place.
-_toast = st.session_state.pop("_toast", None)
-if _toast:
-    st.toast(_toast[0])
 
 # ---------------------------------------------------------------------------
 # Item Master (Browse & Edit)
@@ -4703,7 +5355,12 @@ def render_item_master_tab() -> None:
             # visible (and undoable) in the Pending Item Master Changes
             # section above. A pending Add never appears here anyway,
             # since it isn't in dbo.items until it's pushed.
+            n_hidden = len(df)
             df = df[~df["UPC"].isin(item_master_pending.keys())]
+            n_hidden -= len(df)
+            if n_hidden:
+                st.caption(f"{n_hidden:,} item(s) with a change waiting on Pending Changes are left out of this grid "
+                           "until it's pushed or taken back.")
 
     # Cascading filters: Department/Brand/Source options each narrow to
     # whatever the OTHER two are currently set to — pick a Source and
@@ -4742,7 +5399,14 @@ def render_item_master_tab() -> None:
     brand_filter = col2.selectbox("Brand", brands, key=brand_key)
     source_filter = col3.selectbox("Source", sources_available, key=source_key_filter)
     search = col4.text_input("Search description, brand or UPC", key=search_key)
-    mcol1, mcol2 = st.columns([1.6, 2.4], vertical_alignment="center")
+    def _clear_im_filters():
+        for k in (dept_key, brand_key, source_key_filter):
+            st.session_state[k] = "All"
+        st.session_state[search_key] = ""
+        st.session_state["im_manual_only"] = False
+        st.session_state["im_page_num"] = 1
+    mcol1, mcol2, mcol3 = st.columns([1.6, 2.4, 1], vertical_alignment="center")
+    mcol3.button("Clear filters", key="im_clear_filters", on_click=_clear_im_filters, width='stretch')
     manual_only = mcol1.checkbox("Only manually-edited items", key="im_manual_only")
     edited_by = "Anyone"
     if manual_only:
@@ -4793,22 +5457,60 @@ def render_item_master_tab() -> None:
         st.session_state[page_num_key] = total_pages
     page_num = pcol2.number_input("Page", min_value=1, max_value=total_pages, step=1, key=page_num_key)
     with pcol3.container(key="im_page_caption"):
-        st.caption(f"{matched_count:,} matching items ({len(df):,} total) — page {page_num:,} of {total_pages:,}")
+        st.caption(f"{matched_count:,} matching item{'' if matched_count == 1 else 's'} ({len(df):,} total) — "
+                   f"page {page_num:,} of {total_pages:,}")
 
     start = (page_num - 1) * page_size
     page_df = filtered.iloc[start:start + page_size]
 
     if is_admin:
-        st.caption(
-            'Edit cells, then Stage Changes — Push on Pending Changes makes them live.',
-            help=("Edit cells directly, then click Stage Changes — they'll show up on the Pending "
-            "Changes tab for every editor immediately; Push there actually applies them. Only this "
-            "page's rows are staged."),
-        )
+        # Edits are kept by UPC (not by grid row), so changing a filter, the
+        # search or the page never loses them — they show again whenever that
+        # item is on screen, and Stage Changes stages all of them at once.
+        editor_key = f"items_editor_{st.session_state.get('_im_editor_v', 0)}"
+        store = st.session_state.setdefault("_im_edits", {})
+        shown_upcs = st.session_state.get("_im_shown_upcs") or []
+        for pos, cols in ((st.session_state.get(editor_key) or {}).get("edited_rows") or {}).items():
+            pos = int(pos)
+            if pos < len(shown_upcs):
+                store.setdefault(shown_upcs[pos], {}).update(cols)
+        originals = df.set_index("UPC")
+        for upc in [u for u in store if u not in originals.index]:
+            del store[upc]  # (that item is gone, or has a pending change staged meanwhile)
+
+        def _edited_row(upc):
+            row = originals.loc[upc].copy()
+            for col, v in store[upc].items():
+                row[col] = v
+            return row
+        edited_upcs = [u for u in store if item_row_changed(_edited_row(u), originals.loc[u])]
+
+        def _discard_edits():
+            st.session_state.pop("_im_edits", None)
+            st.session_state["_im_editor_v"] = st.session_state.get("_im_editor_v", 0) + 1
+
+        bar = st.container(key="im_edit_bar", horizontal=True, vertical_alignment="center")
+        if edited_upcs:
+            bar.markdown(f"**{len(edited_upcs):,} edited row(s)** — not staged yet")
+            stage_clicked = bar.button("Stage Changes", type="primary", key="im_stage")
+            bar.button("Discard", key="im_discard", on_click=_discard_edits)
+        else:
+            stage_clicked = False
+            bar.caption(
+                'Edit cells, then Stage Changes — Push on Pending Changes makes them live.',
+                help=("Edit cells directly, then click Stage Changes (it appears here once you've edited something) — "
+                      "they'll show up on the Pending Changes tab for every editor immediately; Push there actually "
+                      "applies them. Edits are kept while you filter, search or change page."),
+            )
         department_options = load_departments()["department"].tolist()
-        edited = st.data_editor(
-            page_df,
-            key="items_editor",
+        shown = page_df.copy()
+        for upc in [u for u in page_df["UPC"] if u in store]:
+            for col, v in store[upc].items():
+                shown.loc[shown["UPC"] == upc, col] = v
+        st.session_state["_im_shown_upcs"] = shown["UPC"].tolist()
+        st.data_editor(
+            blank_text(shown),
+            key=editor_key,
             width='stretch',
             height=min(IM_GRID_HEIGHT, 38 + 35 * max(len(page_df), 1)),
             hide_index=True,
@@ -4821,27 +5523,25 @@ def render_item_master_tab() -> None:
                 "Department": st.column_config.SelectboxColumn(options=[""] + department_options, required=False),
             },
         )
-        if st.button("Stage Changes", type="primary"):
-            merged = edited.set_index("UPC")
-            original = page_df.set_index("UPC")
+        if page_df.empty:
+            st.info("No items match these filters — Clear filters shows them all.")
+        if stage_clicked:
             changed = {}
-            for upc, row in merged.iterrows():
-                if item_row_changed(row, original.loc[upc]):
-                    changed[upc] = {
-                        "change_type": "edit",
-                        "description": sql_value(row["Description"]),
-                        "department": sql_value(row["Department"]),
-                        "category": sql_value(row["Category"]),
-                        "subcategory": sql_value(row["Subcategory"]),
-                        "brand": sql_value(row["Brand"]),
-                        "pack": sql_value(row["Pack"]),
-                        "size": sql_value(row["Size"]),
-                        "uom": sql_value(row["UOM"]),
-                        "source_key": sql_value(row["SourceKey"]),
-                    }
-            if not changed:
-                st.info("No cells were changed.")
-            else:
+            for upc in edited_upcs:
+                row = _edited_row(upc)
+                changed[upc] = {
+                    "change_type": "edit",
+                    "description": sql_value(row["Description"]),
+                    "department": sql_value(row["Department"]),
+                    "category": sql_value(row["Category"]),
+                    "subcategory": sql_value(row["Subcategory"]),
+                    "brand": sql_value(row["Brand"]),
+                    "pack": sql_value(row["Pack"]),
+                    "size": sql_value(row["Size"]),
+                    "uom": sql_value(row["UOM"]),
+                    "source_key": sql_value(row["SourceKey"]),
+                }
+            if changed:
                 # A UPC already flagged "Manually Edited" above has someone's
                 # deliberate correction sitting in manual_overrides — staging
                 # over it here would silently replace that correction with
@@ -4849,7 +5549,7 @@ def render_item_master_tab() -> None:
                 # these go into ITEM_MASTER_CONFLICT_KEY instead, to be shown
                 # with the existing correction's actual details and confirmed
                 # (or dropped) explicitly, one at a time, below.
-                manually_edited_upcs = set(page_df.loc[page_df["ManuallyEditedBy"].notna(), "UPC"])
+                manually_edited_upcs = set(df.loc[df["ManuallyEditedBy"].notna(), "UPC"])
                 conflicts = {upc: c for upc, c in changed.items() if upc in manually_edited_upcs}
                 safe = {upc: c for upc, c in changed.items() if upc not in manually_edited_upcs}
                 blocked = {}
@@ -4859,11 +5559,12 @@ def render_item_master_tab() -> None:
                 if conflicts:
                     st.session_state.setdefault(ITEM_MASTER_CONFLICT_KEY, {}).update(conflicts)
                 staged_count = len(safe) - len(blocked)
-                if staged_count and not conflicts:
-                    st.success(f"Staged {staged_count} changed row(s) — see Pending Changes to review and push.")
+                _discard_edits()  # staged (or held for review below): no longer grid edits
                 if blocked:
                     render_blocked_item_master_edits(blocked)
-                if staged_count and not conflicts and not blocked:
+                elif staged_count and not conflicts:
+                    st.session_state["_toast"] = (
+                        f"Staged {staged_count} changed row(s) — see Pending Changes to review and push.", "")
                     st.rerun()
 
         pending_conflicts = st.session_state.get(ITEM_MASTER_CONFLICT_KEY) or {}
@@ -4899,6 +5600,8 @@ def render_item_master_tab() -> None:
                         st.rerun()
     else:
         st.caption("(Read only for your role.)")
+        if page_df.empty:
+            st.info("No items match these filters — Clear filters shows them all.")
         st.dataframe(
             page_df, width='stretch', hide_index=True, height=min(IM_GRID_HEIGHT, 38 + 35 * max(len(page_df), 1)),
             column_order=[
@@ -4918,20 +5621,39 @@ def render_dr_settings() -> None:
     st.markdown("#### Departments")
     st.caption("The list everyone picks from. Scan Advantage's own Departments are added automatically.")
     add_col1, add_col2 = st.columns([3, 1])
+    if st.session_state.pop("_clear_new_department", False):
+        st.session_state["new_department_input"] = ""  # (added: the box starts empty for the next one)
     new_dept = add_col1.text_input("Add a new Department", key="new_department_input", label_visibility="collapsed",
                                    placeholder="Add a new Department (e.g. BULK)")
     if add_col2.button("Add", key="add_department_btn", width='stretch'):
-        if new_dept.strip():
-            dept_mapping.add_department(ENGINE, new_dept, actor)
+        name = " ".join(new_dept.split()).upper()
+        existing = {d.upper() for d in load_departments()["department"]}
+        if not name:
+            st.error("Type the new Department's name first.")
+        elif name in existing:
+            st.info(f"**{name}** is already in the list — nothing to add.")
+        elif len(name) > 60:
+            st.error("That's too long for a Department name (60 characters at most).")
+        elif not re.fullmatch(r"[A-Z0-9][A-Z0-9 &/,.'()+-]*", name):
+            st.error("Department names can use letters, numbers, spaces and & / , . ' ( ) + - only.")
+        else:
+            dept_mapping.add_department(ENGINE, name, actor)
             clear_settings_caches()
-            st.session_state["_toast"] = (f"Added **{new_dept.strip().upper()}** — it's in every Department list now.", "")
-            st.rerun()
+            st.session_state["_toast"] = (f"Added **{name}** — it's in every Department list now.", "")
+            st.session_state["_clear_new_department"] = True
+            dept_rerun()
     usage = load_department_usage()
     st.dataframe(
         usage.rename(columns={"department": "Department", "source_type": "From", "Groups": "Groups decided",
                               "Staged": "Staged changes", "Defaults": "Unmatched Defaults", "Items": "Items now"}),
         hide_index=True, width='stretch', height=min(420, 40 + 35 * len(usage)),
-        column_config={"From": st.column_config.TextColumn(help="auto = one of Scan Advantage's own; manual = added here")},
+        column_config={
+            "Department": st.column_config.TextColumn(width="medium", pinned=True),
+            "From": st.column_config.TextColumn(help="auto = one of Scan Advantage's own; manual = added here"),
+            # numbers with thousands separators
+            **{c: st.column_config.NumberColumn(format="localized") for c in
+               ["Groups decided", "Item decisions", "Staged changes", "UPC overrides", "Unmatched Defaults", "Items now"]},
+        },
     )
     manual_depts = usage.loc[usage["source_type"] == "manual", "department"].tolist()
     if manual_depts:
@@ -4947,7 +5669,7 @@ def render_dr_settings() -> None:
             dept_mapping.remove_department(ENGINE, to_remove, actor)
             clear_settings_caches()
             st.session_state["_toast"] = (f"Removed **{to_remove}** from the Department list.", "")
-            st.rerun()
+            dept_rerun()
         if in_use:
             st.warning(f"**{to_remove}** can't be removed while it's in use — "
                        + ", ".join(f"{n:,} {k}" for k, n in in_use.items())
@@ -4971,7 +5693,9 @@ def render_dr_settings() -> None:
             "trust_direct_evidence": st.column_config.CheckboxColumn("Trust direct evidence", default=False),
         },
     )
-    if st.button("Save Strict Departments", type="primary", key="save_strict_btn"):
+    # (nothing edited: nothing to save — saving re-runs the Department engine, about half a minute)
+    if st.button("Save Strict Departments", type="primary", key="save_strict_btn",
+                 disabled=not grid_edited("strict_departments_editor")):
         rows = edited_strict.dropna(subset=["source_key", "old_department"])
         rows = rows[rows["old_department"].astype(str).str.strip() != ""]
         with db_begin() as conn:
@@ -5068,7 +5792,7 @@ def render_unmatched_defaults_editor(editable: bool) -> None:
                 "new_department": st.column_config.SelectboxColumn("Default", options=departments, required=True),
             },
         )
-        if st.button("Save exceptions", key="save_umd_exceptions"):
+        if st.button("Save exceptions", key="save_umd_exceptions", disabled=not grid_edited("umd_exceptions")):
             rows = ex_edit.dropna(subset=["source_key", "old_department", "new_department"])
             with db_begin() as conn:
                 conn.execute(text("DELETE FROM dbo.dept_mapping_unmatched_defaults WHERE source_key <> 'any'"))
@@ -5135,7 +5859,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             card_actions(c3, f"undo_recent_{combo_id}",
                          lambda: open_undo_picker(combo_id, f"{latest['source_key'].upper()} — {latest['label']}"))
             twice = load_import_notes().get(combo_id)
-            bits = [f"{latest['n_upcs_total']:,} items"]
+            bits = [n_items(latest['n_upcs_total'])]
             if latest.get("origin_note"):
                 bits.append(short_note(latest["origin_note"]))
             if twice:
@@ -5175,14 +5899,14 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             c1.caption(" · ".join(bits))
             if who == actor or is_admin:
                 with c3.columns(2)[1].popover("↩ Undo…", width="stretch"):
-                    st.markdown(f"Remove these **{len(upcs):,}** staged UPC override(s)? Nothing live changes — "
+                    st.markdown(f"Remove {'this staged UPC override' if len(upcs) == 1 else f'these **{len(upcs):,}** staged UPC overrides'}? Nothing live changes — "
                                 "they're just taken back out of Pending Changes.")
                     if st.button("Remove them", key=f"undo_overrides_{key}_{combo_id}", type="primary"):
                         dept_mapping.delete_item_master_pending_many(ENGINE, upcs)
                         load_item_master_pending.clear()
                         load_pending_overrides_by_group.clear()
                         st.session_state["_toast"] = (f"Took back {len(upcs):,} staged UPC override(s) for **{text_ or src.upper()}**.", "")
-                        st.rerun()
+                        dept_rerun()
             with st.expander(f"Show affected items ({len(upcs):,})", key=f"ov_items_{key}_{combo_id}"):
                 st.dataframe(g[["upc", "description", "now", "department"]].rename(columns={
                     "upc": "UPC", "description": "Description", "now": "Now", "department": "Will be"}),
@@ -5230,7 +5954,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         h1.markdown("#### Old-workbook import")
         if is_admin:
             with h2.popover("Undo the whole import…", width="stretch"):
-                summ = dept_mapping.old_workbook_import_summary(ENGINE)
+                summ = load_import_summary()
                 st.markdown(
                     f"Takes back everything the import still has here: **{summ['groups']}** group decision(s), "
                     f"**{summ['items']:,}** Broken Out item decision(s), **{summ['overrides']:,}** UPC override(s), "
@@ -5245,7 +5969,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                     if r["kept"]:
                         msg += " Left alone: " + "; ".join(r["kept"])
                     st.session_state["_toast"] = (msg, "")
-                    st.rerun()
+                    dept_rerun()
         st.caption("What a workbook upload staged or moved, kept apart. Its decisions go out with the Push above; "
                    "its UPC overrides from the Pending Changes tab.")
         render_import_choices()
@@ -5299,7 +6023,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         # it registers here; it only actually fires once every
         # backer has clicked it too (or an admin/single-backer
         # short-circuits it), see dept_mapping.request_undo_combo.
-        combo_undo_requests = dept_mapping.get_undo_requests(ENGINE, "combo", list(visible_pending_changes.keys()))
+        combo_undo_requests = load_undo_requests("combo", tuple(visible_pending_changes.keys()))
         by_combo = {}
         for upc, change in pending_upc_changes.items():
             by_combo.setdefault(change["combo_id"], []).append((upc, change))
@@ -5314,8 +6038,8 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         combo_ids_with_upc_suggestions = {s[0]["combo_id"] for s in visible_upc_change_suggestions.values()}
         needs_agreement_upc_combo_ids = [cid for cid in visible_by_combo if cid in combo_ids_with_upc_suggestions]
         eligible_upc_combo_ids_all = [cid for cid in visible_by_combo if cid not in combo_ids_with_upc_suggestions]
-        upc_group_primaries = dept_mapping.get_broken_out_group_primaries(ENGINE, list(visible_by_combo.keys()))
-        upc_group_undo_requests = dept_mapping.get_undo_requests(ENGINE, "upc_group", list(visible_by_combo.keys()))
+        upc_group_primaries = load_group_primaries(tuple(visible_by_combo.keys()))
+        upc_group_undo_requests = load_undo_requests("upc_group", tuple(visible_by_combo.keys()))
 
         def _render_group_row(combo_id, change):
             with st.container(border=True, key=f"card_pc_{combo_id}"):
@@ -5341,6 +6065,9 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                 requested = combo_undo_requests.get(combo_id, set())
                 if requested and not is_primary_stager:
                     c1.caption(f"Undo requested by {', '.join(sorted(requested))} — waiting on **{change.get('staged_by') or 'the stager'}**.")
+                elif requested:  # (it's yours: they're asking you)
+                    c1.markdown(f":orange[**{', '.join(sorted(requested))} asked you to undo this** — use ↩ Undo… to take "
+                                "it back, or leave it.]")
                 line, twice = group_line(combo_id, change, change.get("origin_note"))
                 c1.caption(line, help=twice)
 
@@ -5367,7 +6094,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                     else:
                         st.session_state["_toast"] = (f"{toast_verb} **{change['label']}** → {new_dept}.", "")
                     st.session_state[f"_reset_suggest_{combo_id}"] = True
-                    st.rerun()
+                    dept_rerun()
 
                 is_locked = bool(change.get("overridden_by"))
                 if is_locked and not is_admin:
@@ -5381,7 +6108,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                     show_agree = actor not in combo_backers.get(combo_id, set())
                     # under ↩ Undo… / 🛡️ Override: "I also agree", then the dropdown (type to search) and its button
                     agree_col = c_act if show_agree else None
-                    scol1, scol2 = c_act.columns([2.3, 1], vertical_alignment="bottom")
+                    scol1, scol2 = c_act.columns([1.6, 1], vertical_alignment="bottom")  # (room for the button label)
                     if show_agree:
                         if agree_col.button(
                             f"I also agree — {change['department']}", key=f"dept_pending_agree_{combo_id}",
@@ -5396,7 +6123,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                                 )
                             clear_dept_suggestion_caches()
                             st.session_state["_toast"] = (f"Recorded your agreement on **{change['label']}**.", "")
-                            st.rerun()
+                            dept_rerun()
                     suggest_key = f"dept_pending_suggest_{combo_id}"
                     # Must run BEFORE the selectbox below is instantiated —
                     # st.session_state can't reassign an already-
@@ -5490,6 +6217,9 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                 requested = upc_group_undo_requests.get(combo_id, set())
                 if requested and not is_primary_editor:
                     c1.caption(f"Undo requested by {', '.join(sorted(requested))} — waiting on **{primary or 'the first editor'}**.")
+                elif requested:  # (it's yours: they're asking you)
+                    c1.markdown(f":orange[**{', '.join(sorted(requested))} asked you to undo this** — use ↩ Undo… to take "
+                                "it back, or leave it.]")
 
                 if group_suggestions:
                     render_upc_change_suggestions(group_suggestions, pending_upc_changes, combo_id)
@@ -5540,7 +6270,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                         if locked_n:
                             msg_bits.append(f"{locked_n} locked by an admin override")
                         st.session_state["_toast"] = ((", ".join(msg_bits) or "Nothing changed") + ".", "")
-                        st.rerun()
+                        dept_rerun()
 
 
         # Partitioned BEFORE anything renders, off whatever's already in
@@ -5586,9 +6316,13 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         # button to make it happen, before scrolling through the
         # (potentially long) lists below. ----
         left_out = total_pending_upcs - included_item_count
-        st.warning(f"Push makes the **{included_item_count:,}** included item(s) live right away"
-                   + (f" ({left_out:,} left out stay staged)" if left_out else "") + ". A push can't be undone — "
-                   "a pushed group can be sent back or re-decided later.")
+        if included_item_count:
+            st.warning(f"Push makes the **{included_item_count:,}** included item(s) live right away"
+                       + (f" ({left_out:,} left out stay staged)" if left_out else "") + ". A push can't be undone — "
+                       "a pushed group can be sent back or re-decided later.")
+        else:
+            st.info(f"Nothing is included in the next Push — tick Include on a change below to push it"
+                    + (f" ({left_out:,} item(s) staged, left out)." if left_out else "."))
         dept_push_approvals = dept_mapping.get_dept_push_approvals(ENGINE)
         dept_distinct_approvers = sorted({a["approver"] for a in dept_push_approvals})
         dept_required = dept_mapping.DEPT_PUSH_REQUIRED_APPROVALS
@@ -5602,7 +6336,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             if st.session_state["name"] not in dept_distinct_approvers:
                 if st.button("Approve this batch", key="approve_dept_push"):
                     dept_mapping.approve_dept_push(ENGINE, st.session_state["name"])
-                    st.rerun()
+                    dept_rerun()
             else:
                 st.caption("You've already approved this batch.")
         dept_enough_approvals = is_admin or len(dept_distinct_approvers) >= dept_required
@@ -5610,14 +6344,9 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         n_questions = len(load_import_choices())
         if n_questions:
             st.error(f"Answer the {n_questions} **Needs your choice** question{'s' if n_questions > 1 else ''} above before pushing.")
-        confirm_push = st.checkbox(
-            "I've reviewed these changes and I'm ready to update the database.", key="confirm_push_dept_changes",
-        )
-        if st.button(
-            f"Push {included_item_count:,} Included Item(s) to the Database", type="primary",
-            key="push_pending_changes",
-            disabled=not (confirm_push and dept_enough_approvals) or not included_item_count or bool(n_questions),
-        ):
+        if _push_confirm("I've reviewed these changes and I'm ready to update the database.", "confirm_push_dept_changes",
+                         f"Push {included_item_count:,} Included Item(s) to the Database", "push_pending_changes",
+                         dept_enough_approvals and bool(included_item_count) and not n_questions):
             included_upcs = [upc for cid in included_upc_combo_ids for upc, _ in visible_by_combo[cid]]
             included_pending_changes = {cid: pending_changes[cid] for cid in included_combo_ids}
             included_pending_upc_changes = {upc: pending_upc_changes[upc] for upc in included_upcs}
@@ -5682,13 +6411,16 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             # Carried straight into the item master's Department (and
             # any computed Merge draft) — no separate Merge needed.
             with st.spinner("Updating Department in the item master..."):
-                synced = dept_mapping.sync_item_departments(ENGINE)
-            load_items.clear()
+                # (only the pushed groups' items and the pushed items — nothing else changed)
+                synced = dept_mapping.sync_item_departments(
+                    ENGINE, set(dept_mapping.combo_member_upcs(ENGINE, included_pending_changes))
+                    | set(included_pending_upc_changes))
+            clear_items_cache()
             st.session_state["_toast"] = (
                 f"Pushed {pushed_count:,} item(s). Item Master updated — {synced['items']:,} item "
                 "department(s) changed.", "",
             )
-            st.rerun()
+            dept_rerun()
 
         imp_combo_ids = [cid for cid in visible_pending_changes if is_import(visible_pending_changes[cid].get("origin_note"))]
         imp_upc_ids = [cid for cid in visible_by_combo
@@ -5710,18 +6442,19 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         all_ids = reg(list(visible_pending_changes)) + reg(eligible_upc_combo_ids_all)
         if len(all_ids) > 1:
             b1, b2, _ = st.columns([1, 1, 2.5])
-            if b1.button(f"Include all {len(all_ids)}", key="dept_pending_include_all", width="stretch"):
+            imp_note = "The old-workbook import's changes above have their own Include ticks."
+            if b1.button(f"Include these {len(all_ids)}", key="dept_pending_include_all", width="stretch", help=imp_note):
                 for cid in reg(list(visible_pending_changes)):
                     st.session_state[f"dept_pending_include_combo_{cid}"] = True
                 for cid in reg(eligible_upc_combo_ids_all):
                     st.session_state[f"dept_pending_include_upc_group_{cid}"] = True
-                st.rerun()
-            if b2.button("Leave all out", key="dept_pending_include_none", width="stretch"):
+                dept_rerun()
+            if b2.button(f"Leave these {len(all_ids)} out", key="dept_pending_include_none", width="stretch", help=imp_note):
                 for cid in reg(list(visible_pending_changes)):
                     st.session_state[f"dept_pending_include_combo_{cid}"] = False
                 for cid in reg(eligible_upc_combo_ids_all):
                     st.session_state[f"dept_pending_include_upc_group_{cid}"] = False
-                st.rerun()
+                dept_rerun()
         if not (reg(included_combo_ids) or reg(included_upc_combo_ids)):
             st.caption("Nothing currently included — check \"Include\" on a Saved for Later item below, or resolve a Needs Agreement one.")
         else:
@@ -5797,14 +6530,10 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
 
 def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_suggestions) -> None:
     """Department Review → Broken Out."""
+    # Reopened from the address (?group=): open the page that group is on.
+    # (Not by searching for it — the search is shared with the other
+    # sections, which would then all look filtered down to that one group.)
     url_group = st.session_state.pop("_url_group", None)
-    if url_group and not get_shared_dept_filter()["search"]:
-        # reopened from the address: show just that group
-        with ENGINE.connect() as _c:
-            lbl = dept_mapping._combo_labels(_c, [url_group]).get(url_group)
-        if lbl:
-            get_shared_dept_filter()["search"] = lbl[1]
-            get_dept_tab_filters()["broken_out"] = {**get_shared_dept_filter()}
     broken_df = load_broken_out_combos()
     broken_df = broken_df[~broken_df["combo_id"].isin(pending_changes.keys())].copy()
     # "Left" = still-undecided items plus auto-decided ones nobody has
@@ -5844,9 +6573,18 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
         filtered = sort_full_df(filtered, sort_column, sort_desc)
 
         page_num_key = "broken_out_page_num"
+        jump_to = _jump_page("Broken Out", filtered, page_num_key, "broken_out")
+        if jump_to is not None:
+            _outline_card(f"card_bo_{jump_to}")  # (it waits for the card to be drawn)
+        if url_group is not None and url_group in set(filtered["combo_id"].astype(int)):
+            pos = list(filtered["combo_id"].astype(int)).index(url_group)
+            size = st.session_state.get(_dept_filter_keys("broken_out")[3]) or DEFAULT_GROUP_PAGE_SIZE
+            st.session_state[page_num_key] = pos // size + 1
+            if jump_to is None:
+                _outline_card(f"card_bo_{url_group}")  # (a link to the group: show it, as a shortcut does)
         page_size, page_num, total_pages = render_page_controls(
             "broken_out", page_num_key, len(filtered),
-            f"{len(filtered):,} group{'s' if len(filtered) != 1 else ''} · {int(filtered['pending_count'].sum()):,} items to decide",
+            f"{len(filtered):,} group{'s' if len(filtered) != 1 else ''} · {n_items(filtered['pending_count'].sum())} to decide",
         )
 
         start = (page_num - 1) * page_size
@@ -5876,26 +6614,29 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
                 left_n = all_n - int(row["decided_count"])
                 done_n = all_n - left_n - auto_n
                 c1.markdown(f"**{row['source_key'].upper()}** — {label}")
-                # One bar, two colours: decided and live (green), then staged but
-                # not pushed yet (orange); the legend under it says which is which.
+                # One bar: decided and live (green), staged but not pushed yet
+                # (orange), then auto-matched and waiting to be confirmed (light
+                # blue); the legend under it says which is which.
                 staged_n = min(staged_here, max(all_n - done_n, 0))
+                auto_left = min(auto_n, max(all_n - done_n - staged_n, 0))
                 pct = lambda n: f"{(100 * n / all_n) if all_n else 0:.2f}%"
                 c1.markdown(
                     "<div style='display:flex;height:8px;border-radius:4px;overflow:hidden;margin:2px 0 6px;"
                     "background:rgba(250,250,250,0.1)'>"
                     f"<div style='width:{pct(done_n)};background:#21c354'></div>"
-                    f"<div style='width:{pct(staged_n)};background:#ffa421'></div></div>",
+                    f"<div style='width:{pct(staged_n)};background:#ffa421'></div>"
+                    f"<div style='width:{pct(auto_left)};background:rgba(96,180,255,0.45)'></div></div>",
                     unsafe_allow_html=True)
                 bits = [f":green[●] **{done_n:,}** done", f":orange[●] **{staged_n:,}** staged", f"**{left_n - staged_n if left_n > staged_n else 0:,}** to decide"]
                 if auto_n:
-                    bits.append(f"{auto_n:,} auto")
-                bits.append(f"{all_n:,} items")
+                    bits.append(f":blue[●] {auto_n:,} auto")
+                bits.append(f"{all_n:,} item{'' if all_n == 1 else 's'}")
                 if pending_sugg_here:
                     bits.append(f"{pending_sugg_here} suggestion(s) waiting on Pending Changes")
                 if claim and claim["claimed_by"] != actor:
                     claimed_when = pd.to_datetime(claim["claimed_at"], errors="coerce")
                     bits.append(f"{claim['claimed_by']} is working on this"
-                                + (f" (since {claimed_when:%b %d %I:%M %p})" if pd.notna(claimed_when) else ""))
+                                + (f" (since {local_time(claimed_when)})" if pd.notna(claimed_when) else ""))
                 elif claim:
                     bits.append("You're working on this group")
                 c1.caption(" · ".join(bits))
@@ -5918,7 +6659,7 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
                         dept_mapping.release_broken_out_claim(ENGINE, combo_id, actor, is_admin=True)
                         load_broken_out_claims.clear()
                         st.session_state["_toast"] = (f"Force-released the claim on **{label}**.", "")
-                        st.rerun()
+                        dept_rerun(catch_up=False)
                     continue
 
                 if not claim:
@@ -5930,7 +6671,7 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
                             st.session_state["_toast"] = (f"{result['claimed_by']} started on this just before you — try another.", "")
                         else:
                             st.session_state[f"_open_bo_{combo_id}"] = True
-                        st.rerun()
+                        dept_rerun(catch_up=False)
                     continue
 
                 # claim["claimed_by"] == actor from here on.
@@ -5938,7 +6679,7 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
                 if c_act.button("Done — release it", key=f"release_claim_{combo_id}", width='stretch'):
                     dept_mapping.release_broken_out_claim(ENGINE, combo_id, actor)
                     load_broken_out_claims.clear()
-                    st.rerun()
+                    dept_rerun(catch_up=False)
 
                 def _stage_upc_decisions(decisions: dict) -> None:
                     # Re-checked against the DB fresh for every UPC,
@@ -5968,7 +6709,7 @@ def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_sugges
                         last = dept_mapping.peek_undo_redo(ENGINE, actor)["undo"]
                         if last and last["combo_id"] == combo_id:
                             st.session_state.setdefault("_excel_staged_actions", {})[last["action_id"]] = tag
-                    st.rerun()
+                    dept_rerun()
 
                 items_df = load_pending_upc_overrides(combo_id)
                 items_df = items_df[~items_df["upc"].isin(pending_upc_changes.keys())]
@@ -6031,7 +6772,7 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
         page_size, page_num, total_pages = render_page_controls(
             "decided", page_num_key, len(filtered),
             f"{len(filtered):,} group{'s' if len(filtered) != 1 else ''} ({n_whole:,} as a whole, {len(filtered) - n_whole:,} item by item)"
-            f" · {int(filtered['n_upcs_total'].sum()):,} items",
+            f" · {n_items(filtered['n_upcs_total'].sum())}",
         )
 
         start = (page_num - 1) * page_size
@@ -6055,10 +6796,10 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                 how = str(row["status"]).split(" — ")[-1]  # Auto / Manual / Partially Auto / Fully Auto
                 c1.markdown(f"**{row['source_key'].upper()}** — {label}  \n"
                             + (f"Decided as **{row['decided_department']}**" if is_whole else "Decided item by item"))
-                bits = [f"{int(row['n_upcs_total']):,} items", how]
+                bits = [n_items(row['n_upcs_total']), how]
                 if pd.notna(row.get("last_decided_by")):
                     when = pd.to_datetime(row["last_decided_at"], errors="coerce")
-                    bits.append(f"by {row['last_decided_by']}" + (f", {when:%b %d %Y}" if pd.notna(when) else ""))
+                    bits.append(f"by {row['last_decided_by']}" + (f", {local_time(when, '%b %d %Y')}" if pd.notna(when) else ""))
                 pushed_by = row.get("pushed_by")
                 if pd.notna(pushed_by) and pushed_by != row.get("last_decided_by"):
                     bits.append(f"pushed by {pushed_by}")
@@ -6082,7 +6823,7 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                                          f"Send Back to {queue_name}", is_whole),
                                  help=f"Send Back to {queue_name} for a fresh decision (undoable)")
                     card_undo_button(a2, combo_id, f"{row['source_key'].upper()} — {label}", undoable, f"undo_card_dec_{combo_id}")
-                    dc1, dc2 = c_act.columns([2.3, 1], vertical_alignment="bottom")
+                    dc1, dc2 = c_act.columns([1.6, 1], vertical_alignment="bottom")  # (room for the button label)
                     new_dept = dc1.selectbox(
                         "New department", [d for d in department_options if d != row["decided_department"]], index=None,
                         key=f"decided_change_dept_{combo_id}", label_visibility="collapsed", placeholder="Change Department",
@@ -6101,14 +6842,16 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                             st.session_state["_toast"] = (f"Staged: **{label}** → {new_dept}. See Pending Changes to push.", "")
                         else:
                             st.session_state["_toast"] = (f"Staged as a suggestion for **{label}** — see Pending Changes.", "")
-                        st.rerun()
+                        dept_rerun()
                     if row["status"] == "Whole Group — Auto":
                         # confirming an automatic decision just marks it as reviewed by a person
                         if c_act.button("Mark as reviewed", key=f"confirm_whole_{combo_id}", width='stretch'):
                             with track(combo_id, f"{row['source_key'].upper()} — {label}", "Marked as reviewed"):
                                 dept_mapping.confirm_combo_decision(ENGINE, combo_id, st.session_state["name"])
                             load_decided_combos.clear()
-                            st.rerun()
+                            st.session_state["_toast"] = (f"Marked **{row['source_key'].upper()} — {label}** as reviewed "
+                                                          f"({row['decided_department']}). Undo takes it back.", "")
+                            dept_rerun()
                 else:
                     popup_button(a1, "Back to Broken Out", f"revert_decided_{combo_id}",
                                  partial(request_break_out, combo_id, row["source_key"], label, int(row["n_upcs_total"]),
@@ -6138,7 +6881,9 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                                         dept_mapping.confirm_upc_decisions(ENGINE, auto_upcs, st.session_state["name"])
                                     load_combo_upc_decisions.clear()
                                     load_decided_combos.clear()
-                                    st.rerun()
+                                    st.session_state["_toast"] = (f"Confirmed {len(auto_upcs):,} auto-decided item(s) in "
+                                                                  f"**{label}** as reviewed. Undo takes it back.", "")
+                                    dept_rerun()
                             # Changing an item here is a real decision, so it's
                             # staged to Pending Changes (push + undo there) rather
                             # than applied — same as deciding it on Broken Out.
@@ -6171,7 +6916,7 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                                 reset_item_workbench(f"dc_{combo_id}")
                                 if not decisions:
                                     st.session_state["_toast"] = ("Those are already the current departments — nothing to stage.", "ℹ️")
-                                    st.rerun()
+                                    dept_rerun()
                                 with st.spinner(f"Staging {len(decisions):,} item(s)..."):
                                     with track(combo_id, f"{row['source_key'].upper()} — {label}", f"Staged {len(decisions)} item change(s) on Decided"):
                                         results = dept_mapping.stage_broken_out_decisions(ENGINE, decisions, actor, is_admin=is_admin)
@@ -6183,7 +6928,7 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
                                     + (f" {n_sugg} sent as suggestion(s) to whoever already staged them." if n_sugg else ""),
                                     "",
                                 )
-                                st.rerun()
+                                dept_rerun()
 
         render_bottom_pagination("decided_page_size", page_num_key, "decided", total_pages)
 
@@ -6210,6 +6955,27 @@ def card_undo_button(container, combo_id: int, label: str, undoable: set, key: s
     if combo_id not in undoable:
         return
     popup_button(container, "↩ Undo…", key, partial(open_undo_picker, combo_id, label))
+
+
+def _approve_group(tier: str, combo_id: int, source_key: str, label: str, n_items: int) -> None:
+    """Approve on a Crosswalk / Unmatched card: saved on the click itself, so
+    the section redraws once, already without the card."""
+    globals()["CLICK_ID"] = uuid.uuid4().hex  # one id per click, for the top-bar Undo
+    chosen = st.session_state.get(f"dept_choice_{tier}_{combo_id}")
+    if not chosen:
+        st.session_state["_toast"] = ("Pick a Department first.", "")
+        return
+    with track(combo_id, f"{source_key.upper()} — {label}", f"Approved as {chosen}"):
+        result = dept_mapping.upsert_combo_suggestion(ENGINE, combo_id, tier, chosen, source_key, label, n_items,
+                                                      st.session_state["name"])
+    clear_dept_suggestion_caches()
+    st.session_state["_dept_dirty"] = True
+    if result["disputed"]:
+        st.session_state["_toast"] = (f"**{source_key.upper()} — {label}** now has more than one suggested department "
+                                      f"({', '.join(result['departments'])}) — see Pending Changes to discuss and agree.", "")
+    else:
+        st.session_state["_toast"] = (f"Staged: **{source_key.upper()} — {label}** → {chosen} ({n_items:,} item(s)). "
+                                      "See Pending Changes to push it.", "")
 
 
 def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) -> None:
@@ -6240,9 +7006,10 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
         filtered = sort_full_df(filtered, sort_column, sort_desc)
 
         page_num_key = f"dept_review_page_num_{tier}"
+        jump_to = _jump_page(review_subtab, filtered, page_num_key, f"dept_review_{tier}")
         page_size, page_num, total_pages = render_page_controls(
             f"dept_review_{tier}", page_num_key, len(filtered),
-            f"{len(filtered):,} group{'s' if len(filtered) != 1 else ''} · {int(filtered['n_upcs_total'].sum()):,} items",
+            f"{len(filtered):,} group{'s' if len(filtered) != 1 else ''} · {n_items(filtered['n_upcs_total'].sum())}",
         )
 
         start = (page_num - 1) * page_size
@@ -6271,7 +7038,7 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
                     st.session_state["_toast"] = (f"Staged {len(suggested_rows) - n_disputed} group(s) as suggested"
                                                   + (f"; {n_disputed} went to Needs agreement" if n_disputed else "")
                                                   + " — see Pending Changes.", "")
-                    st.rerun()
+                    dept_rerun()
 
         prefetch_affected_items(zip(page_df["combo_id"], page_df["n_upcs_total"]))
         undoable = undoable_groups()
@@ -6284,14 +7051,14 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
                 suggested = row["suggested_department"]
                 c1.markdown(f"**{row['source_key'].upper()}** — {label}  \n"
                             + (f"Suggested **{suggested}**" if isinstance(suggested, str) and suggested else "No suggestion yet"))
-                bits = [f"{int(row['n_upcs_total']):,} items", evidence_sentence(row)]
+                bits = [n_items(row['n_upcs_total']), evidence_sentence(row)]
                 n_ov = load_override_counts().get(combo_id, 0)
                 if n_ov:
                     bits.append(f"{n_ov:,} with a UPC override" + (" (all of them)" if n_ov >= int(row["n_upcs_total"]) else ""))
                 c1.caption(" · ".join(b for b in bits if b))
 
                 break_col, undo_col = top_row(c_act, combo_id in undoable)
-                dept_col, approve_col = c_act.columns([2.3, 1], vertical_alignment="bottom")
+                dept_col, approve_col = c_act.columns([1.6, 1], vertical_alignment="bottom")  # (room for "Approve")
                 options_with_blank = [""] + department_options
                 default_index = options_with_blank.index(suggested) if suggested in options_with_blank else 0
                 chosen_dept = dept_col.selectbox(
@@ -6299,29 +7066,9 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
                     key=f"dept_choice_{tier}_{combo_id}", label_visibility="collapsed",
                     placeholder="Pick a Department",
                 )
-                if approve_col.button("Approve", key=f"approve_{tier}_{combo_id}", type="primary", width='stretch'):
-                    if not chosen_dept:
-                        st.error("Pick a Department first.")
-                    else:
-                        with track(combo_id, f"{row['source_key'].upper()} — {label}", f"Approved as {chosen_dept}"):
-                            result = dept_mapping.upsert_combo_suggestion(
-                                ENGINE, combo_id, tier, chosen_dept, row["source_key"], label,
-                                int(row["n_upcs_total"]), st.session_state["name"],
-                            )
-                        clear_dept_suggestion_caches()
-                        if result["disputed"]:
-                            st.session_state["_toast"] = (
-                                f"**{row['source_key'].upper()} — {label}** now has more than one suggested "
-                                f"department ({', '.join(result['departments'])}) — see Pending Changes to discuss and agree.",
-                                "",
-                            )
-                        else:
-                            st.session_state["_toast"] = (
-                                f"Staged: **{row['source_key'].upper()} — {label}** → {chosen_dept} "
-                                f"({int(row['n_upcs_total']):,} item(s)). See Pending Changes to push it.",
-                                "",
-                            )
-                        st.rerun()
+                approve_col.button("Approve", key=f"approve_{tier}_{combo_id}", type="primary", width='stretch',
+                                   on_click=_approve_group, args=(tier, combo_id, row["source_key"], label,
+                                                                  int(row["n_upcs_total"])))
                 card_undo_button(undo_col, combo_id, f"{row['source_key'].upper()} — {label}", undoable, f"undo_card_{tier}_{combo_id}")
                 # Not a department decision: it moves the group to the item-by-item
                 # queue (undoable from Undo…), after a popup that asks where to start.
@@ -6329,6 +7076,8 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
                              partial(request_break_out, combo_id, row["source_key"], label, int(row["n_upcs_total"])),
                              help="Decide this group item by item instead (moves it to Broken Out now)")
                 render_affected_items_expander(combo_id, int(row["n_upcs_total"]), "review_items")
+            if combo_id == jump_to:
+                _outline_card(f"card_q_{tier}_{combo_id}")
 
         render_bottom_pagination(f"dept_review_{tier}_page_size", page_num_key, f"dept_review_{tier}", total_pages)
 
@@ -6354,61 +7103,96 @@ DR_SUBTAB_MORE = {
 }
 
 
+DR_SECTIONS = ["Crosswalk", "Unmatched", "Broken Out", "Pending Changes", "Decided", "Settings"]
+
+
 def render_department_review_tab() -> None:
-    """The Department Review tab: shared loading, then the chosen sub-tab."""
+    """The Department Review tab. All six sections are built and sent to
+    the browser as tabs, so switching between them is instant — no server
+    trip. Each section is its own fragment (see _dr_section): an action in
+    one re-runs only that section, and the rest catches up quietly."""
     st.subheader("Department Review")
     render_merge_staleness_banner()
-    pending_changes = load_dept_pending_changes()
-    pending_upc_changes = load_dept_pending_upc_changes()
-    combo_suggestions = load_combo_suggestions()
-    upc_change_suggestions = load_upc_change_suggestions()
-    recent_moves = load_dept_recent_moves()
-    # Counted in items, not "changes" — a single Approve on a
-    # 13,000-item Crosswalk group and 176 individually-staged Broken
-    # Out items used to both just say "1" and "176" respectively,
-    # which made the number meaningless as a "how much is about to
-    # change" warning. Counting both the same way (by UPC) makes it
-    # an honest measure of real scale either way. Disputed combos
-    # count too (staged, not push-eligible yet) — a pending UPC
-    # suggestion doesn't add to the count separately, since the UPC
-    # it targets is already decided and counted via pending_upc_changes.
-    total_pending_upcs = (
-        sum(c["n_upcs_total"] for c in pending_changes.values()) + len(pending_upc_changes)
-        + sum(s[0]["n_upcs_total"] for s in combo_suggestions.values())
-    )
-    # Settings (Departments, Strict Departments, defaults, the workbook
-    # tools) is for admins; editors see a form to request a change instead.
-    review_subtabs = ["Crosswalk", "Unmatched", "Broken Out", "Pending Changes", "Decided", "Settings"]
-    if st.session_state.get("dept_review_subtab") not in (None, *review_subtabs):
+    # Which section opens: the address (?sub=) on a fresh load, or a request
+    # to open one (a notification's Open, the tests). A new request re-opens
+    # the tabs on it; otherwise the section you're on stays as it is.
+    if st.session_state.get("dept_review_subtab") not in (None, *DR_SECTIONS):
         st.session_state.pop("dept_review_subtab")
-    if "dept_review_subtab" not in st.session_state and st.query_params.get("sub") in review_subtabs:
+    if "dept_review_subtab" not in st.session_state and st.query_params.get("sub") in DR_SECTIONS:
         st.session_state["dept_review_subtab"] = st.query_params["sub"]
-    review_subtab = st.radio(
-        "Department Review section", review_subtabs,
-        horizontal=True, label_visibility="collapsed", key="dept_review_subtab",
-    )
+    want = st.session_state.get("dept_review_subtab") or "Crosswalk"
+    if want != st.session_state.get("_dr_default"):
+        st.session_state["_dr_default"] = want
+        st.session_state["_dr_nav"] = st.session_state.get("_dr_nav", 0) + 1
 
-    line = DR_SUBTAB_HELP.get(review_subtab)
-    if total_pending_upcs and review_subtab != "Pending Changes":
-        line = (line + " · " if line else "") + f"{total_pending_upcs:,} item(s) staged, not pushed yet"
-    if line:
-        st.caption(line, help=DR_SUBTAB_MORE.get(review_subtab))
-
+    st.session_state.pop("_dept_dirty", None)  # this full run brings every section up to date
     if not show_dept_dialog():
         st.empty()  # holds the popup's place, so closing one doesn't shift (and redraw) the page below
 
-    if review_subtab == 'Settings' and not is_admin:
-        render_settings_request_form()
-    elif review_subtab == 'Settings':
-        render_dr_settings()
-    elif review_subtab == 'Pending Changes':
-        render_dr_pending_changes(pending_changes, pending_upc_changes, combo_suggestions, upc_change_suggestions, recent_moves, total_pending_upcs)
-    elif review_subtab == 'Broken Out':
-        render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_suggestions)
-    elif review_subtab == 'Decided':
+    tabs = st.tabs(DR_SECTIONS, default=want, key=f"dr_sections_{st.session_state.get('_dr_nav', 0)}")
+    for name, tab in zip(DR_SECTIONS, tabs):
+        with tab:
+            _dr_section(name)
+    # The page script presses this (hidden) once a section has re-run on its
+    # own after an action, so the other sections and counts catch up.
+    st.button("Catch up", key="dr_catch_up_btn", on_click=_dr_catch_up_cb)
+
+
+@st.fragment
+def _dr_section(name: str) -> None:
+    """One Department Review section. Its own buttons re-run just this
+    section (dept_rerun), so actions stay quick with every section built."""
+    if _only_fragments_running() and st.session_state.pop("_full_rerun", False):
+        st.rerun()  # (an "Open in …" button in this section: the whole page switches to where it points)
+    st.session_state.pop("_full_rerun", None)
+    if _only_fragments_running():
+        globals()["CLICK_ID"] = uuid.uuid4().hex  # a section's own run is its own click, for the top-bar Undo
+    globals()["_IN_DR_SECTION"] = True
+    try:
+        _dr_section_body(name)
+    finally:
+        globals()["_IN_DR_SECTION"] = False
+    if _only_fragments_running() and st.session_state.get("_dept_dirty"):
+        st.html('<div class="app-catchup-needed"></div>')  # the page script presses Catch up
+
+
+def _dr_section_body(name: str) -> None:
+    if _only_fragments_running():  # (a full run shows these at the top of the page)
+        toast = st.session_state.pop("_toast", None)
+        if toast:
+            st.toast(toast[0])
+    pending_changes = load_dept_pending_changes()
+    pending_upc_changes = load_dept_pending_upc_changes()
+    combo_suggestions = load_combo_suggestions()
+    # Counted in items, not "changes" — one Approve on a 13,000-item group and
+    # 176 separately staged items should read as what's really about to change.
+    total_pending_upcs = (
+        sum(c["n_upcs_total"] for c in pending_changes.values()) + len(pending_upc_changes)
+        + sum(sg[0]["n_upcs_total"] for sg in combo_suggestions.values())
+    )
+    line = DR_SUBTAB_HELP.get(name)
+    if total_pending_upcs and name != "Pending Changes":
+        line = (line + " · " if line else "") + f"{total_pending_upcs:,} item(s) staged, not pushed yet"
+    if line:
+        st.caption(line, help=DR_SUBTAB_MORE.get(name))
+    if name == "Settings":
+        if is_admin:
+            render_dr_settings()
+        else:
+            render_settings_request_form()
+    elif name == "Pending Changes":
+        render_dr_pending_changes(pending_changes, pending_upc_changes, combo_suggestions, load_upc_change_suggestions(),
+                                  load_dept_recent_moves(), total_pending_upcs)
+    elif name == "Broken Out":
+        render_dr_broken_out(pending_changes, pending_upc_changes, load_upc_change_suggestions())
+    elif name == "Decided":
         render_dr_decided(pending_changes, pending_upc_changes)
-    elif review_subtab in ('Crosswalk', 'Unmatched'):
-        render_dr_review_queue(review_subtab, pending_changes, combo_suggestions)
+    else:
+        render_dr_review_queue(name, pending_changes, combo_suggestions)
+
+
+def _dr_catch_up_cb() -> None:
+    st.session_state["_quiet_run"] = True  # (nothing moves: the section you're on already shows it)
 
 
 # -------------------------------------------------------------------
@@ -6426,17 +7210,18 @@ def render_add_item_tab() -> None:
     # the dropdown and type to filter/search it, same as any other
     # Streamlit selectbox — no separate search box needed.
     add_item_department_options = [""] + load_departments()["department"].tolist()
-    with st.form("add_item_form", clear_on_submit=True):
+    # (the form clears only after a successful add, so a mistake doesn't wipe what was typed)
+    with st.form(f"add_item_form_{st.session_state.get('_add_item_ver', 0)}"):
         c1, c2 = st.columns(2)
-        new_upc = c1.text_input("UPC *")
-        new_description = c2.text_input("Description *")
+        new_upc = c1.text_input("UPC *", max_chars=20)
+        new_description = c2.text_input("Description *", max_chars=400)
         new_department = c1.selectbox("Department", add_item_department_options)
-        new_category = c2.text_input("Category")
-        new_subcategory = c1.text_input("Subcategory")
-        new_brand = c2.text_input("Brand")
-        new_pack = c1.text_input("Pack (optional)")
-        new_size = c2.text_input("Size (optional)")
-        new_uom = c1.text_input("UOM (optional)")
+        new_category = c2.text_input("Category", max_chars=200)
+        new_subcategory = c1.text_input("Subcategory", max_chars=200)
+        new_brand = c2.text_input("Brand", max_chars=200)
+        new_pack = c1.text_input("Pack (optional)", max_chars=100)
+        new_size = c2.text_input("Size (optional)", max_chars=100)
+        new_uom = c1.text_input("UOM (optional)", max_chars=50)
         submitted = st.form_submit_button("Add Item", type="primary")
 
         if submitted:
@@ -6445,9 +7230,13 @@ def render_add_item_tab() -> None:
             if not typed_upc or not new_description:
                 st.error("UPC and Description are required.")
             elif new_upc == INVALID_UPC:
-                st.error(f"“{typed_upc}” isn't a valid UPC.")
+                # (the same cleaning every source file's UPCs go through)
+                st.error(f"“{typed_upc}” isn't a valid UPC — {invalid_upc_reason(typed_upc)}.")
             elif upc_exists(new_upc):
-                st.error(f"UPC {new_upc} already exists.")
+                with db_connect() as _c:
+                    _d = _c.execute(text("SELECT description FROM dbo.items WHERE upc = :u"), {"u": new_upc}).scalar()
+                st.error(f"UPC {new_upc} is already in the item master ({_d or 'no description'}). "
+                         "To change it, use UPC Overrides.")
             elif new_upc in item_master_pending:
                 render_blocked_item_master_edits({new_upc: item_master_pending[new_upc]})
             else:
@@ -6461,7 +7250,8 @@ def render_add_item_tab() -> None:
                 if blocked:
                     render_blocked_item_master_edits({new_upc: blocked})
                 else:
-                    st.success(f"Staged adding {new_upc} — {new_description}. See Pending Changes to review and push.")
+                    st.session_state["_toast"] = (f"Staged adding {new_upc} — {new_description}. See Pending Changes to review and push.", "")
+                    st.session_state["_add_item_ver"] = st.session_state.get("_add_item_ver", 0) + 1
                     st.rerun()
 
     st.divider()
@@ -6485,8 +7275,8 @@ def render_add_item_tab() -> None:
         if manual_search:
             ms = manual_search.lower()
             manual_matches = manual_df[
-                manual_df["Description"].fillna("").str.lower().str.contains(ms)
-                | manual_df["UPC"].str.contains(ms)
+                manual_df["Description"].fillna("").str.lower().str.contains(ms, regex=False)
+                | manual_df["UPC"].str.contains(ms, regex=False)
             ]
 
         matched_count = len(manual_matches)
@@ -6522,191 +7312,380 @@ def render_add_item_tab() -> None:
             )
             remove_choice = st.selectbox("Select item to remove (from this page)", remove_options)
             upc_to_remove = remove_choice.split(" — ")[0]
-            if st.button("Remove Manually-Added Item", type="secondary"):
+            # (it goes at once, not through Pending Changes — so it asks first, naming the item)
+            confirm_box = st.popover("Remove Manually-Added Item…")
+            confirm_box.markdown(f"Remove **{remove_choice}** from the item master now? It goes straight away (not "
+                                 "through Pending Changes) and is kept under **Delete Item → Deleted items**, where it can be restored.")
+            if confirm_box.button("Remove it", type="primary", key="remove_manual_confirm"):
                 remove_row = manual_page_df[manual_page_df["UPC"] == upc_to_remove].iloc[0]
                 push_item_master_delete(upc_to_remove, {
                     f: sql_value(remove_row[ITEM_MASTER_FIELD_TO_DF_COLUMN[f]])
                     for f in ("description", "department", "category", "subcategory", "brand", "pack", "size", "uom")
                 }, st.session_state["name"])
                 activity("Items", "Removed a manually-added item (live right away)", upc_to_remove, 1)
-                load_items.clear()
+                clear_items_cache()
                 load_manual_items.clear()
                 load_deleted_items.clear()
-                st.success(f"Removed {upc_to_remove}. It's kept under Deleted Items if you need to restore it.")
+                st.session_state["_toast"] = (f"Removed {upc_to_remove}. It's kept under Deleted Items if you need to restore it.", "")
                 st.rerun()
 
 
 # -------------------------------------------------------------------
 # Delete Item
 # -------------------------------------------------------------------
-def render_delete_item_tab() -> None:
-    """The Delete Item tab."""
-    st.subheader("Delete an item")
-    item_master_pending = item_master_pending_cross_link()
-    render_bulk_upload("delete", "Deleting many items")
+def restore_as_saved(upc: str, row) -> None:
+    """Brings a deleted item back exactly as it was when deleted — live right
+    away, kept as a manual correction so a Merge leaves it as it is."""
+    vals = {"upc": upc, "description": sql_value(row["description"]) or upc,
+            "source_key": sql_value(row["source_key"]) if "source_key" in row.index else None,
+            **{f: sql_value(row[f]) for f in ("department", "category", "subcategory", "brand", "pack", "size", "uom")}}
+    with db_begin() as conn:
+        upload_reports.ensure_tables(conn)  # (dept_state)
+        dept_state = conn.execute(text("SELECT dept_state FROM dbo.deleted_upcs WHERE upc = :upc"), {"upc": upc}).scalar()
+        conn.execute(text("DELETE FROM dbo.deleted_upcs WHERE upc = :upc"), {"upc": upc})
+        dept_mapping.put_back_in_groups(conn, upc, dept_state)  # (back in its Department Review group, as it was)
+        conn.execute(text(
+            """MERGE dbo.items AS target USING (SELECT :upc AS upc) AS src ON target.upc = src.upc
+               WHEN MATCHED THEN UPDATE SET description = :description, department = :department,
+                   category = :category, subcategory = :subcategory, brand = :brand,
+                   pack = :pack, size = :size, uom = :uom, source_key = COALESCE(:source_key, target.source_key),
+                   updated_at = SYSUTCDATETIME()
+               WHEN NOT MATCHED THEN INSERT (upc, description, department, category, subcategory, brand, pack, size, uom, source_key)
+                   VALUES (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :source_key);"""), vals)
+        # Restoring is a manual decision, same as Add Item — persist it so it also survives the next Merge.
+        conn.execute(text(
+            """MERGE dbo.manual_overrides AS target USING (SELECT :upc AS upc) AS src ON target.upc = src.upc
+               WHEN MATCHED THEN UPDATE SET description = :description, department = :department,
+                   category = :category, subcategory = :subcategory, brand = :brand,
+                   pack = :pack, size = :size, uom = :uom, updated_by = :updated_by, updated_at = SYSUTCDATETIME()
+               WHEN NOT MATCHED THEN INSERT (upc, description, department, category, subcategory, brand, pack, size, uom, updated_by)
+                   VALUES (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :updated_by);"""),
+            {**vals, "updated_by": st.session_state["name"]})
+    activity("Items", "Restored a deleted item (live right away)", upc, 1)
+
+
+def stage_deleted_info(items: list) -> str:
+    """Puts back the information a returned item had when it was deleted, over
+    what it came back with — staged on Pending Changes like any edit (a
+    Department in a Broken Out group goes to its item decision, the rest to a
+    UPC override). items: returned_items rows. Returns the toast text."""
+    actor = st.session_state["name"]
+    upcs = [r["upc"] for r in items]
+    df = pd.DataFrame([{"upc": r["upc"], **{f: (_txt(saved) or "") for f, saved, _now in r["diffs"]}} for r in items])
+    for f in item_bulk.FIELDS:
+        if f not in df.columns:
+            df[f] = ""
+    live_df = load_items()
+    live = {r["UPC"]: {f: r[ITEM_MASTER_FIELD_TO_DF_COLUMN[f]] for f in item_bulk.FIELDS} | {"source_key": r["SourceKey"]}
+            for r in live_df[live_df["UPC"].isin(upcs)].to_dict("records")}
+    departments = load_departments()["department"].tolist()
+    _, changes, decisions = item_bulk.check_upload("edit", df, live, departments, load_item_master_pending(), actor,
+                                                   dept_mapping.broken_out_items(ENGINE, upcs))
+    n_dec = 0
+    for cid, grp in pd.DataFrame([{"upc": u, **d} for u, d in decisions.items()]).groupby("combo_id") if decisions else []:
+        cid = int(cid)
+        glabel = f"{(grp['source_key'].iloc[0] or '').upper()} — {grp['label'].iloc[0]}"
+        group_changes = {r["upc"]: {k: r[k] for k in ("department", "combo_id", "label", "description", "source_key")}
+                         | {"combo_id": cid} for r in grp.to_dict("records")}
+        with track(cid, glabel, f"Put back {len(group_changes)} deleted item(s)' Department"):
+            res = dept_mapping.stage_broken_out_decisions(ENGINE, group_changes, actor, is_admin=is_admin)
+        n_dec += sum(1 for r in res.values() if r["status"] == "decided")
+    with dept_mapping.activity_via("Delete Item — came back different"):
+        blocked = dept_mapping.save_item_master_pending_bulk(ENGINE, changes, actor) if changes else {}
+    if decisions:
+        clear_dept_suggestion_caches()
+    load_item_master_pending.clear()
+    dept_mapping.clear_returned(ENGINE, [u for u in upcs if u not in blocked])
+    load_deleted_items.clear()
+    return (f"Staged the deleted information for {len(upcs) - len(blocked):,} item(s) — {len(changes) - len(blocked):,} "
+            f"UPC override(s), {n_dec:,} Broken Out item decision(s). Push them on Pending Changes."
+            + (f" {len(blocked):,} skipped: someone else already has a change staged on them." if blocked else ""))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_returned_items(marker) -> dict:
+    """dept_mapping.returned_items, after clearing the ones that came back the same."""
+    dept_mapping.settle_returned_items(ENGINE)
+    return dept_mapping.returned_items(ENGINE)
+
+
+def render_returned_items() -> None:
+    """Delete Item: deleted items a newer file brought back. One that came back
+    exactly as it was deleted needs nothing (its deleted record is cleared);
+    one that came back different is shown field by field, with the choice to
+    put the deleted information back over it."""
+    markers = _upload_markers()
+    ret = load_returned_items((tuple(sorted(markers.items())), len(load_deleted_items()), len(load_items())))
+    if ret["waiting"]:
+        st.caption(f"{len(ret['waiting']):,} deleted item(s) are in a newer file and come back with the next Merge push: "
+                   + ", ".join(r["upc"] for r in ret["waiting"][:8]) + ("…" if len(ret["waiting"]) > 8 else ""))
+    if not ret["different"]:
+        return
+    with st.container(border=True, key="returned_different"):
+        st.markdown(f"**{len(ret['different']):,} deleted item(s) came back from a file — different from when they were deleted**")
+        st.caption("They're back as the file and their group have them. If the information it had when it was deleted "
+                   "is the right one, put it back (staged on Pending Changes); otherwise keep it as it came back.")
+        picked = []
+        for r in ret["different"]:
+            with st.container(border=True, key=f"returned_{r['upc']}"):
+                c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+                c1.markdown(f"**{r['upc']}** — {_txt(r['now_description']) or _txt(r['description'])}")
+                c1.caption(f"Deleted {fmt_when(r['deleted_at'])} by {r['deleted_by'] or '?'} · came back in "
+                           f"{r['returned_file'] or 'a newer file'} ({fmt_when(r['returned_at'])})")
+                if c2.checkbox("Put back", key=f"returned_pick_{r['upc']}", help="Put the deleted item's information back"):
+                    picked.append(r)
+                st.dataframe(pd.DataFrame([{"Field": ITEM_MASTER_FIELD_LABELS.get(f, f), "When deleted": _txt(saved),
+                                            "Now": _txt(now) or "(blank)"} for f, saved, now in r["diffs"]]),
+                             hide_index=True, width='stretch')
+        b1, b2 = st.columns(2)
+        if b1.button(f"Use the deleted info for {len(picked):,} item(s)" if picked else "Use the deleted info",
+                     key="returned_apply", type="primary", disabled=not picked, width='stretch'):
+            with st.spinner(f"Staging {len(picked):,} item(s)..."):
+                msg = stage_deleted_info(picked)
+            load_returned_items.clear()
+            st.session_state["_toast"] = (msg, "")
+            st.rerun()
+        rest = [r["upc"] for r in ret["different"] if r not in picked]
+        if b2.button(f"Keep the other {len(rest):,} as they came back" if picked else "Keep them all as they came back",
+                     key="returned_keep", disabled=not rest, width='stretch'):
+            dept_mapping.clear_returned(ENGINE, rest)
+            load_returned_items.clear()
+            load_deleted_items.clear()
+            st.session_state["_toast"] = (f"Kept {len(rest):,} item(s) as they came back from the file.", "")
+            st.rerun()
+
+
+def render_deleted_in_file(cleaned_df: pd.DataFrame, source_key: str, source_name: str, key: str) -> None:
+    """Upload preview: deleted items this file lists — they come back when it's
+    saved and merged (and are checked against how they were when deleted)."""
+    deleted = load_deleted_items()
+    back = deleted[dept_mapping.isin_fast(deleted["upc"], cleaned_df["UPC"]) & deleted["returned_at"].isna()] \
+        if "returned_at" in deleted.columns else deleted[dept_mapping.isin_fast(deleted["upc"], cleaned_df["UPC"])]
+    if back.empty:
+        return
+    with st.expander(f"Deleted items this file lists · {len(back):,} — they come back with this file"):
+        st.caption("Once it's saved and merged they're back as the file and their group have them. Any that come back "
+                   "different from when they were deleted are listed on Delete Item, to put the deleted information back if "
+                   "that's the right one.")
+        st.dataframe(pd.DataFrame({"UPC": back["upc"], "Description": back["description"].fillna(""),
+                                   "Deleted": back["deleted_at"].map(fmt_when), "By": back["deleted_by"].fillna("")}),
+                     hide_index=True, width='stretch', height=min(320, 38 + 35 * len(back)))
+
+
+def _txt(v) -> str:
+    """A cell as text — blank for a missing value (None / NaN)."""
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+
+@st.dialog("Someone has work on these items", width="large")
+def _confirm_stage_deletes(upcs: list, where: str, combined_into: dict, note: str, conflicts: list) -> None:
+    """Before deleting or combining items that carry someone else's staged work."""
+    verb = "combining" if combined_into else "deleting"
+    blocked = sorted({c[0] for c in conflicts if c[3]})
+    rest = [u_ for u_ in upcs if u_ not in blocked]
+    st.markdown(f"{len({c[0] for c in conflicts}):,} of the {len(upcs):,} item(s) you're {verb} have work in progress on them:")
+    shown = pd.DataFrame([c[:3] for c in conflicts], columns=["UPC", "What", "Whose"])
+    if len(shown) <= 12:  # (a plain table draws with the popup itself; a grid comes a moment later and resizes it)
+        st.table(shown.set_index("UPC"))
+    else:
+        st.dataframe(shown, hide_index=True, width='stretch', height=min(300, 38 + 35 * len(conflicts)))
+    if blocked:
+        st.error(f"{len(blocked):,} of them can't be staged yet — each already has someone else's change waiting on "
+                 "Pending Changes (an item holds one at a time). They push it or take it back first; an admin can also "
+                 "take it back there.")
+    if len(blocked) < len(conflicts) or (rest and not blocked):
+        st.caption(f"If the {verb[:-3]}e is pushed, a staged Department decision on a removed item is dropped (they're "
+                   "told), and the item leaves the Broken Out group it's in. Check with them first if you're not sure.")
+    c1, c2 = st.columns(2)
+    if rest:
+        label = f"Stage {verb} anyway" if not blocked else f"Stage {verb} the other {len(rest):,}"
+        if c1.button(label, type="primary", width='stretch', key="confirm_stage_deletes_go"):
+            stage_deletes(rest, where, {k: v for k, v in (combined_into or {}).items() if k in rest} or None,
+                          note=note, force=True)
+    elif c1.button("Open Pending Changes", type="primary", width='stretch', key="confirm_stage_deletes_pending"):
+        st.session_state["_nav_to_tab"] = "Pending Changes"
+        st.rerun()
+    if c2.button("Cancel", width='stretch', key="confirm_stage_deletes_cancel"):
+        st.rerun()
+
+
+def stage_deletes(upcs: list, where: str, combined_into: dict = None, fragment: bool = False, note: str = "",
+                  force: bool = False) -> None:
+    """Stages deleting these items (Pending Changes), then reruns with a toast.
+    combined_into: {upc: the UPC it's a duplicate of} — a combine, which keeps
+    that one and keeps this one out for good. fragment: called from a part of
+    the page that redraws on its own — no loading card (staging is quick), and
+    only that part redraws."""
+    combined_into = combined_into or {}
+    if not force:  # (someone else's staged work on these items: say so first)
+        conflicts = dept_mapping.staged_work_on(ENGINE, list(upcs), st.session_state["name"])
+        if conflicts:
+            _confirm_stage_deletes(list(upcs), where, combined_into, note, conflicts)
+            return
+    items = load_items().set_index("UPC").loc[list(upcs)]
+    changes = {u: {"change_type": "delete", "source_key": _txt(r["SourceKey"]) or None,
+                   "combined_into": combined_into.get(u),
+                   **{f: sql_value(r[ITEM_MASTER_FIELD_TO_DF_COLUMN[f]]) for f in ITEM_MASTER_FIELD_LABELS if f != "source_key"}}
+               for u, r in items.iterrows()}
+    with (nullcontext() if fragment else st.spinner(f"Staging {len(changes):,} delete(s)...")), dept_mapping.activity_via(where):
+        blocked = dept_mapping.save_item_master_pending_bulk(ENGINE, changes, st.session_state["name"])
+    load_item_master_pending.clear()
+    st.session_state["_tick_ver"] = st.session_state.get("_tick_ver", 0) + 1  # (the tick tables start clear again)
+    if blocked:
+        render_blocked_item_master_edits(blocked)
+        return
+    if fragment:
+        _frag_done((f"Staged combining {len(changes):,} duplicate(s)" if combined_into else
+                    f"Staged deleting {len(changes):,} item(s)") + note + " — review and push on Pending Changes.")
+    st.session_state["_toast"] = ((f"Staged combining {len(changes):,} duplicate(s) — review and push on Pending Changes."
+                                   if combined_into else
+                                   f"Staged deleting {len(changes):,} item(s) — review and push on Pending Changes."), "")
+    st.rerun()
+
+
+def _pick_column(view: pd.DataFrame, key: str, label: str = "Select", height: int = 420, help_: str = None) -> list:
+    """A table with a tick box per row; returns the UPCs ticked."""
+    if view.empty:
+        return []
+    view = view.copy()
+    view.insert(0, label, False)
+    # The key names the rows shown: a keyed table keeps its ticks by row
+    # position when only its rows change, so without this a tick would move
+    # onto a different item after a new search or once ticked items are staged.
+    rows_id = hashlib.md5(("|".join(map(str, view["UPC"])) + f"#{st.session_state.get('_tick_ver', 0)}").encode()).hexdigest()[:10]
+    edited = st.data_editor(
+        view, key=f"{key}_{rows_id}", hide_index=True, width='stretch', height=min(height, 38 + 35 * max(len(view), 1)),
+        disabled=[c for c in view.columns if c != label],
+        column_config={label: st.column_config.CheckboxColumn(default=False, help=help_)},
+    )
+    return [u for u, v in zip(edited["UPC"], edited[label]) if v]
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_duplicate_pairs(fingerprint) -> pd.DataFrame:
+    """dept_mapping.duplicate_pairs for the current item master, scored by how
+    alike each pair's words are (most alike first)."""
+    pairs = dept_mapping.duplicate_pairs(load_items())
+    pairs["_alike"] = [_alike(f"{r['Description (shorter)']} {r['Brand (shorter)']}",
+                              f"{r['Description (longer)']} {r['Brand (longer)']}") for _, r in pairs.iterrows()]
+    return pairs.sort_values("_alike", ascending=False)
+
+
+def _alike(a_, b_) -> float:
+    """How alike two items' words are (0–1), from description + brand."""
+    words = lambda t: {w for w in re.findall(r"[a-z0-9]+", _txt(t).lower()) if len(w) > 1}
+    x, y = words(a_), words(b_)
+    return len(x & y) / max(1, min(len(x), len(y)))
+
+
+def render_find_and_delete(item_master_pending: dict) -> None:
+    """Delete Item → Find and delete: search, tick the items, stage deleting them."""
     df = load_items()
     df = df[~df["UPC"].isin(item_master_pending.keys())]
-    if df.empty:
-        st.info("No items in the table.")
+    search = st.text_input("Search by description or UPC to find the item to delete", key="delete_search",
+                           placeholder="Type part of a description or a UPC…", label_visibility="collapsed")
+    if not search:
+        st.caption(f"Search the {len(df):,} items, then tick the ones to delete.")
     else:
-        delete_search = st.text_input("Search by description or UPC to find the item to delete")
-        if not delete_search:
-            st.caption(f"Type part of a description or UPC to find it among {len(df):,} items.")
+        s_ = search.lower().strip()
+        matches = df[df["Description"].str.lower().str.contains(s_, na=False, regex=False)
+                     | df["UPC"].str.contains(s_, na=False, regex=False)]
+        # an exact UPC first (typing a whole UPC must never pick a different item that contains it)
+        matches = matches.assign(_exact=matches["UPC"] != s_).sort_values("_exact", kind="stable").drop(columns="_exact")
+        if matches.empty:
+            st.info("No items match that search.")
         else:
-            s = delete_search.lower()
-            matches = df[
-                df["Description"].str.lower().str.contains(s, na=False)
-                | df["UPC"].str.contains(s, na=False)
-            ]
-            if matches.empty:
-                st.info("No items match that search.")
-            else:
-                MAX_DELETE_MATCHES = 200
-                if len(matches) > MAX_DELETE_MATCHES:
-                    st.warning(f"{len(matches)} items match — showing the first {MAX_DELETE_MATCHES}. Narrow your search to find a specific item.")
-                    matches = matches.head(MAX_DELETE_MATCHES)
+            MAX = 200
+            if len(matches) > MAX:
+                st.caption(f"{len(matches):,} items match — showing the first {MAX}. Narrow the search to find one.")
+                matches = matches.head(MAX)
+            view = matches[["UPC", "Description", "Department", "Category", "Subcategory", "Brand", "SourceKey"]].rename(
+                columns={"SourceKey": "Source"}).fillna("")
+            picked, pressed = _tick_form(view, "delete_pick_grid", "Delete", "Stage deleting",
+                                         "Tick to stage deleting it", f"{len(view):,} match(es) — tick the ones to delete.")
+            if pressed:
+                if picked:
+                    stage_deletes(picked, "Delete Item")
+                else:
+                    st.toast("Tick at least one item first.")
+    render_bulk_upload("delete", "Deleting many items")
 
-                options = matches.apply(lambda r: f"{r['UPC']} — {r['Description']}", axis=1)
-                choice = st.selectbox(f"Select item to delete ({len(matches)} match(es))", options)
-                upc_to_delete = choice.split(" — ")[0]
-                st.warning(f"Stages deleting {upc_to_delete}. Once pushed, no Merge brings it back; it can be restored "
-                           "from Deleted Items below.")
-                if st.button("Delete Item", type="secondary"):
-                    item_row = matches[matches["UPC"] == upc_to_delete].iloc[0]
-                    blocked = dept_mapping.save_item_master_pending(
-                        ENGINE, upc_to_delete, "delete",
-                        sql_value(item_row["Description"]), sql_value(item_row["Department"]),
-                        sql_value(item_row["Category"]), sql_value(item_row["Subcategory"]),
-                        sql_value(item_row["Brand"]), st.session_state["name"],
-                        pack=sql_value(item_row["Pack"]), size=sql_value(item_row["Size"]),
-                        uom=sql_value(item_row["UOM"]),
-                    )
-                    load_item_master_pending.clear()
-                    if blocked:
-                        render_blocked_item_master_edits({upc_to_delete: blocked})
-                    else:
-                        st.success(f"Staged deleting {upc_to_delete}. See Pending Changes to review and push.")
-                        st.rerun()
 
-    st.divider()
-    st.subheader("Deleted items")
-    st.caption("Items deleted here are excluded from every future Merge until restored.")
-    deleted_df = load_deleted_items()
+def render_deleted_list(deleted_df: pd.DataFrame) -> None:
+    """Delete Item → Deleted: the deleted items, tick to restore."""
     if deleted_df.empty:
-        st.caption("No items have been deleted.")
-    else:
-        restore_search = st.text_input("Search deleted items by description or UPC (optional — narrows the table below)", key="restore_search")
-        deleted_matches = deleted_df
-        if restore_search:
-            rs = restore_search.lower()
-            deleted_matches = deleted_df[
-                deleted_df["description"].fillna("").str.lower().str.contains(rs)
-                | deleted_df["upc"].str.contains(rs)
-            ]
+        st.caption("No items are deleted right now.")
+        return
+    markers = _upload_markers()
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    in_files = {}
+    for k in labels:
+        have = load_raw_upcs(k, markers.get(k))
+        for u in deleted_df["upc"]:
+            if u in have:
+                in_files.setdefault(u, []).append(labels[k] or k)
+    q = st.text_input("Search deleted items", key="restore_search", label_visibility="collapsed",
+                      placeholder="Search deleted items by description or UPC…").strip().lower()
+    rows = deleted_df
+    if q:
+        rows = deleted_df[deleted_df["description"].fillna("").str.lower().str.contains(q, regex=False)
+                          | deleted_df["upc"].str.contains(q, regex=False)]
+    if rows.empty:
+        st.info("No deleted items match that search.")
+        return
+    view = pd.DataFrame({
+        "UPC": rows["upc"], "Description": rows["description"].fillna(""),
+        "Deleted": rows["deleted_at"].map(fmt_when), "By": rows["deleted_by"].fillna(""),
+        "In a file now": rows["upc"].map(lambda u: ", ".join(in_files.get(u, []))),
+        "Combined into": rows["combined_into"].fillna("") if "combined_into" in rows.columns else "",
+        "Department": rows["department"].fillna(""), "Category": rows["category"].fillna(""),
+        "Subcategory": rows["subcategory"].fillna(""), "Brand": rows["brand"].fillna(""),
+    })
+    st.caption(f"{len(view):,} deleted item(s). Restoring puts one back straight away, exactly as it was. "
+               "One that's “In a file now” also comes back by itself when that source's next file is saved — "
+               "except a duplicate that was combined into another item (“Combined into”), which stays out until "
+               "it's restored here.")
+    picked, pressed = _tick_form(view, "restore_pick_grid", "Restore", "Restore",
+                                 "Tick to restore it as it was", "Each comes back exactly as it was when deleted.")
+    if pressed and not picked:
+        st.toast("Tick at least one item first.")
+    elif pressed:
+        by = rows.set_index("upc")
+        with st.spinner(f"Restoring {len(picked):,} item(s)..."):
+            for u in picked:
+                restore_as_saved(u, by.loc[u])
+        clear_items_cache(picked)
+        load_deleted_items.clear()
+        load_manual_items.clear()
+        st.session_state["_toast"] = (f"Restored {len(picked):,} item(s) — back in the item master as they were.", "")
+        st.rerun()
 
-        matched_count = len(deleted_matches)
-        if matched_count == 0:
-            st.info("No deleted items match that search.")
-        else:
-            # Same paging pattern as Item Master — a page is always shown
-            # by default (no search required); as the deleted list grows,
-            # search narrows it and the table/dropdown refresh to match.
-            dpage_size_key, dpage_num_key = "restore_page_size", "restore_page_num"
-            page_size_options = [50, 100, 200, 500, 1000]
-            default_index = page_size_options.index(200)
-            page_size = st.session_state.get(dpage_size_key, 200)
-            total_pages = max(1, (matched_count - 1) // page_size + 1)
-            if st.session_state.get(dpage_num_key, 1) > total_pages:
-                st.session_state[dpage_num_key] = total_pages
 
-            dcol1, dcol2, dcol3 = st.columns([1, 1, 3])
-            page_size = dcol1.selectbox("Rows per page", page_size_options, index=default_index, key=dpage_size_key)
-            total_pages = max(1, (matched_count - 1) // page_size + 1)
-            if st.session_state.get(dpage_num_key, 1) > total_pages:
-                st.session_state[dpage_num_key] = total_pages
-            page_num = dcol2.number_input("Page", min_value=1, max_value=total_pages, step=1, key=dpage_num_key)
-            with dcol3.container(key="deleted_page_caption"):
-                st.caption(f"{matched_count} deleted item(s) — page {page_num} of {total_pages}")
-
-            start = (page_num - 1) * page_size
-            deleted_page_df = deleted_matches.iloc[start:start + page_size]
-
-            st.dataframe(deleted_page_df, width='stretch', hide_index=True)
-
-            restore_options = deleted_page_df.apply(
-                lambda r: f"{r['upc']} — {r['description'] or '(no description saved)'}", axis=1
-            )
-            restore_choice = st.selectbox("Select item to restore (from this page)", restore_options)
-            upc_to_restore = restore_choice.split(" — ")[0]
-            if st.button("Restore Item", type="secondary"):
-                restore_row = deleted_page_df[deleted_page_df["upc"] == upc_to_restore].iloc[0]
-                activity("Items", "Restored a deleted item (live right away)", upc_to_restore, 1)
-                with db_begin() as conn:
-                    conn.execute(text("DELETE FROM dbo.deleted_upcs WHERE upc = :upc"), {"upc": upc_to_restore})
-                    conn.execute(
-                        text(
-                            """
-                            MERGE dbo.items AS target
-                            USING (SELECT :upc AS upc) AS src ON target.upc = src.upc
-                            WHEN MATCHED THEN UPDATE SET
-                                description = :description, department = :department,
-                                category = :category, subcategory = :subcategory, brand = :brand,
-                                pack = :pack, size = :size, uom = :uom,
-                                updated_at = SYSUTCDATETIME()
-                            WHEN NOT MATCHED THEN INSERT
-                                (upc, description, department, category, subcategory, brand, pack, size, uom)
-                            VALUES
-                                (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom);
-                            """
-                        ),
-                        {
-                            "upc": upc_to_restore,
-                            "description": sql_value(restore_row["description"]) or upc_to_restore,
-                            "department": sql_value(restore_row["department"]),
-                            "category": sql_value(restore_row["category"]),
-                            "subcategory": sql_value(restore_row["subcategory"]),
-                            "brand": sql_value(restore_row["brand"]),
-                            "pack": sql_value(restore_row["pack"]),
-                            "size": sql_value(restore_row["size"]),
-                            "uom": sql_value(restore_row["uom"]),
-                        },
-                    )
-                    # Restoring is a manual decision, same as Add Item —
-                    # persist it so it also survives the next Merge.
-                    conn.execute(
-                        text(
-                            """
-                            MERGE dbo.manual_overrides AS target
-                            USING (SELECT :upc AS upc) AS src ON target.upc = src.upc
-                            WHEN MATCHED THEN UPDATE SET
-                                description = :description, department = :department,
-                                category = :category, subcategory = :subcategory, brand = :brand,
-                                pack = :pack, size = :size, uom = :uom,
-                                updated_by = :updated_by, updated_at = SYSUTCDATETIME()
-                            WHEN NOT MATCHED THEN INSERT
-                                (upc, description, department, category, subcategory, brand, pack, size, uom, updated_by)
-                            VALUES
-                                (:upc, :description, :department, :category, :subcategory, :brand, :pack, :size, :uom, :updated_by);
-                            """
-                        ),
-                        {
-                            "upc": upc_to_restore,
-                            "description": sql_value(restore_row["description"]) or upc_to_restore,
-                            "department": sql_value(restore_row["department"]),
-                            "category": sql_value(restore_row["category"]),
-                            "subcategory": sql_value(restore_row["subcategory"]),
-                            "brand": sql_value(restore_row["brand"]),
-                            "pack": sql_value(restore_row["pack"]),
-                            "size": sql_value(restore_row["size"]),
-                            "uom": sql_value(restore_row["uom"]),
-                            "updated_by": st.session_state["name"],
-                        },
-                    )
-                load_items.clear()
-                load_deleted_items.clear()
-                load_manual_items.clear()
-                st.success(f"Restored {upc_to_restore}.")
-                st.rerun()
+def render_delete_item_tab() -> None:
+    """The Delete Item tab: Find and delete (search, tick, stage) and Deleted
+    (ones a newer file brought back different; tick to restore). The ready-made
+    lists to clean up from are on the Upload Reports tab."""
+    st.subheader("Delete Item")
+    st.caption("Deletes go through Pending Changes. A deleted item is left out of every Merge until it's restored, or a "
+               "newer file lists it again.",
+               help="Pushing a delete takes the item out of the item master and keeps a copy under Deleted. If a source's "
+                    "file saved later lists it again, it comes back with the next Merge — and if it comes back different "
+                    "from when it was deleted, it's shown under Deleted so the deleted information can be put back.")
+    pending = item_master_pending_cross_link()
+    deleted_all = load_deleted_items()
+    deleted_df = deleted_all[deleted_all["returned_at"].isna()]
+    ret = load_returned_items((tuple(sorted(_upload_markers().items())), len(deleted_all), len(load_items())))
+    n_deleted = len(deleted_df) + len(ret["different"])
+    st.caption("To clean up after an upload — items a file dropped, items no file has any more, and possible "
+               "duplicate UPCs — see the Upload Reports tab.")
+    # (the labels never change, so the tab you're on stays open after a restore — a
+    # label with a count in it would change and send you back to the first tab)
+    find, deleted = st.tabs(["Find and delete", "Deleted items"], key="delete_item_tabs")
+    with find:
+        render_find_and_delete(pending)
+    with deleted:
+        render_returned_items()
+        render_deleted_list(deleted_df)
 
 
 # -------------------------------------------------------------------
@@ -6726,15 +7705,20 @@ def render_upc_overrides_tab() -> None:
     render_bulk_upload("edit", "Changing many items (Departments or any other fields)")
     df = load_items()
     df = df[~df["UPC"].isin(item_master_pending.keys())]
+    if st.session_state.pop("_upc_override_clear", False):
+        st.session_state["upc_override_search"] = ""  # just staged: that item is now on Pending Changes
     search = st.text_input("Search by description or UPC", key="upc_override_search")
     if not search:
         st.caption(f"Type part of a description or UPC to find it among {len(df):,} items.")
     else:
         s = search.lower()
+        # (plain text, not a pattern — a "(" or "*" in the search must not break it)
         matches = df[
-            df["Description"].str.lower().str.contains(s, na=False)
-            | df["UPC"].str.contains(s, na=False)
+            df["Description"].str.lower().str.contains(s, na=False, regex=False)
+            | df["UPC"].str.contains(s, na=False, regex=False)
         ]
+        # an exact UPC first (typing a whole UPC must never pick a different item that contains it)
+        matches = matches.assign(_exact=matches["UPC"] != s.strip()).sort_values("_exact", kind="stable").drop(columns="_exact")
         if matches.empty:
             st.info("No items match that search.")
         else:
@@ -6770,20 +7754,20 @@ def render_upc_overrides_tab() -> None:
 
             with st.form(f"upc_override_form_{upc}"):
                 c1, c2 = st.columns(2)
-                new_description = c1.text_input("Description", value=current_description, key=f"ov_desc_{upc}")
+                new_description = c1.text_input("Description", value=current_description, key=f"ov_desc_{upc}", max_chars=400)
                 new_department = c2.selectbox(
                     "Department", dept_select_options,
                     index=dept_select_options.index(current_department_raw or ""), key=f"ov_dept_{upc}",
                 )
                 if current_department_raw and current_department_raw not in department_options:
                     c2.caption(f"“{current_department_raw}” isn't one of the configured departments — pick a real one to fix it, or leave as-is to keep it unchanged.")
-                new_category = c1.text_input("Category", value=current_category, key=f"ov_cat_{upc}")
-                new_subcategory = c2.text_input("Subcategory", value=current_subcategory, key=f"ov_subcat_{upc}")
-                new_brand = c1.text_input("Brand", value=current_brand, key=f"ov_brand_{upc}")
-                new_source_key = c2.text_input("Source Key", value=current_source_key, key=f"ov_source_{upc}")
-                new_pack = c1.text_input("Pack (optional)", value=current_pack, key=f"ov_pack_{upc}")
-                new_size = c2.text_input("Size (optional)", value=current_size, key=f"ov_size_{upc}")
-                new_uom = c1.text_input("UOM (optional)", value=current_uom, key=f"ov_uom_{upc}")
+                new_category = c1.text_input("Category", value=current_category, key=f"ov_cat_{upc}", max_chars=200)
+                new_subcategory = c2.text_input("Subcategory", value=current_subcategory, key=f"ov_subcat_{upc}", max_chars=200)
+                new_brand = c1.text_input("Brand", value=current_brand, key=f"ov_brand_{upc}", max_chars=200)
+                new_source_key = c2.text_input("Source Key", value=current_source_key, key=f"ov_source_{upc}", max_chars=50)
+                new_pack = c1.text_input("Pack (optional)", value=current_pack, key=f"ov_pack_{upc}", max_chars=100)
+                new_size = c2.text_input("Size (optional)", value=current_size, key=f"ov_size_{upc}", max_chars=100)
+                new_uom = c1.text_input("UOM (optional)", value=current_uom, key=f"ov_uom_{upc}", max_chars=50)
                 submitted = st.form_submit_button("Stage Change", type="primary")
 
                 if submitted:
@@ -6811,7 +7795,8 @@ def render_upc_overrides_tab() -> None:
                         if blocked:
                             render_blocked_item_master_edits({upc: blocked})
                         else:
-                            st.success(f"Staged edit for {upc}. See Pending Changes to review and push.")
+                            st.session_state["_toast"] = (f"Staged edit for {upc}. See Pending Changes to review and push.", "")
+                            st.session_state["_upc_override_clear"] = True
                             st.rerun()
 
 
@@ -6871,10 +7856,17 @@ def render_sources_tab() -> None:
                      "source's last uploaded file using the new configuration — no fresh upload "
                      "needed. Unchecked: just updates the configuration for the next upload.",
             ),
+            # Readable headers for every other column (not the database names).
+            **{c: label for c, label in {**SOURCE_FIELD_LABELS, "source_key": "Source Key",
+                                         "created_at": "Created", "updated_at": "Updated"}.items()
+               if c in display_sources.columns and c != "size_format"},
         },
     )
+    for w in st.session_state.pop("_source_stage_warnings", None) or []:
+        st.warning(w)
     if st.button("Stage Source Changes", type="primary"):
         staged_count = 0
+        stage_warnings = []
         for _, row in edited_sources.iterrows():
             original_row = sources_df[sources_df["source_key"] == row["source_key"]].iloc[0]
             # Checking "Apply Now" alone (no other field edited) must still
@@ -6887,11 +7879,21 @@ def render_sources_tab() -> None:
                     st.session_state["name"],
                 )
                 staged_count += 1
+                # Say now (not only at Push) if these settings don't fit the source's last file.
+                fname, missing = source_file_mismatch(row["source_key"], config)
+                if missing:
+                    stage_warnings.append(
+                        f"**{row['source_key']}**: its last file ({fname}) has no "
+                        + ", ".join(f"{what} (“{col}”)" for what, col in missing) + " column. "
+                        + ("With Apply immediately ticked, Push will hold this change back until that's fixed."
+                           if row["Apply Now"] else "The next file uploaded for it needs those, or it'll be rejected."))
         load_source_pending_changes.clear()
         if staged_count == 0:
             st.info("No changes made.")
         else:
-            st.success(f"Staged {staged_count} source change(s) — see Pending Changes to review and push.")
+            st.session_state["_toast"] = (f"Staged {staged_count} source change(s) — see Pending Changes to review and push.", "")
+            if stage_warnings:
+                st.session_state["_source_stage_warnings"] = stage_warnings
             st.rerun()
 
     st.divider()
@@ -7159,7 +8161,7 @@ def render_sources_tab() -> None:
                         )
                         load_source_pending_changes.clear()
                         st.session_state["pending_sources"] = [e for e in st.session_state.get("pending_sources", []) if e["id"] != eid]
-                        st.success(f"Staged adding source '{source_key_clean}' — see Pending Changes to review and push.")
+                        st.session_state["_toast"] = (f"Staged adding source '{source_key_clean}' — see Pending Changes to review and push.", "")
                         st.rerun()
 
 
@@ -7198,148 +8200,1184 @@ def render_pending_changes_tab() -> None:
 # -------------------------------------------------------------------
 # Upload & Ingest
 # -------------------------------------------------------------------
+NEW_ITEM_COLUMNS = ["UPC", "Description", "Brand", "Department", "Category", "Subcategory", "Pack", "Size", "UOM"]
+
+
+def new_items_in(cleaned_df: pd.DataFrame) -> pd.DataFrame:
+    """The rows of a cleaned source file whose UPC isn't in the item master yet
+    (and wasn't deleted by hand) — what a Merge would add. A Merge never
+    changes or removes an item that's already there."""
+    items = load_items()
+    have = set(items["UPC"]) | set(load_deleted_items()["upc"])
+    new = cleaned_df[~dept_mapping.isin_fast(cleaned_df["UPC"], have)]
+    new = new[[c for c in NEW_ITEM_COLUMNS if c in new.columns]]
+    return with_lookalikes(new, items)
+
+
+def with_lookalikes(new: pd.DataFrame, items: pd.DataFrame) -> pd.DataFrame:
+    """Adds "Looks like": an existing item whose UPC is these digits with one more
+    (or one fewer) leading digit — possibly the same item, listed differently."""
+    if new.empty:
+        return new
+    fp = _items_fingerprint()
+    looks = dept_mapping.lookalike_upcs(new["UPC"], _item_upcs(fp))
+    if not looks:
+        return new
+    by = _items_by_upc(fp)
+    return new.assign(**{"Looks like": new["UPC"].map(
+        lambda u: f"{looks[u]} — {_txt(by.at[looks[u], 'Description'])}" if u in looks else "")})
+
+
+def render_new_items(new: pd.DataFrame, where: str, key: str) -> None:
+    """The items an upload would bring in, listed (or a line saying there are none)."""
+    if new.empty:
+        st.caption(f"No new items — every UPC in {where} is already in the item master (or was deleted by hand).")
+        return
+    n_look = int((new["Looks like"] != "").sum()) if "Looks like" in new.columns else 0
+    with st.expander(f"The {len(new):,} new item(s) {where} would add", expanded=len(new) <= 50 or bool(n_look)):
+        if n_look:
+            st.warning(f"{n_look:,} of them look like an item already in the item master, with a digit missing or added "
+                       "at the front of the UPC (see “Looks like”). Both come in as separate items; if "
+                       "they're the same, combine them after the Merge — Upload Reports → Possible duplicate UPCs.")
+            new = new[["Looks like"] + [c for c in new.columns if c != "Looks like"]].sort_values("Looks like", ascending=False)
+        st.dataframe(new, hide_index=True, width='stretch', height=min(420, 38 + 35 * len(new)))
+        st.download_button("Download the list (CSV)", new.to_csv(index=False).encode(), file_name=f"{key}_new_items.csv",
+                           mime="text/csv", key=f"{key}_new_dl")
+
+
+@st.cache_resource(show_spinner=False, max_entries=20)
+def load_raw_upcs(source_key: str, marker) -> frozenset:
+    """The UPCs in a source's current copy of its file, shared and read-only (a
+    frozenset — no copy per call). `marker` (its latest upload) keeps this in
+    step with the data without re-reading it on every click."""
+    with db_connect_cached() as conn:
+        return frozenset(r[0] for r in conn.execute(
+            text("SELECT upc FROM dbo.raw_items WHERE source_key = :s"), {"s": source_key}).all())
+
+
+def _upload_markers() -> dict:
+    """{source: its latest upload id} — keeps the per-source caches below in step."""
+    log = load_ingestion_log()
+    return log.drop_duplicates("source_key").set_index("source_key")["id"].to_dict() if not log.empty else {}
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def load_seen_history(source_key: str, marker) -> pd.DataFrame:
+    """One source's seen-history (see ingest.record_upc_seen); `marker` (its
+    latest upload) keeps it in step with the data."""
+    from itemmaster.ingest import load_upc_seen
+    return load_upc_seen(ENGINE, source_key)
+
+
+@st.cache_data(ttl=60, show_spinner=False, max_entries=5)
+def load_stale_seen(markers: tuple) -> pd.DataFrame:
+    """Items in the item master that no source's current file lists, with their
+    most recent sighting — worked out in the database (one query)."""
+    from itemmaster.ingest import ensure_upc_seen
+    with db_begin() as conn:
+        ensure_upc_seen(conn)
+        return pd.read_sql(text(
+            "SELECT s.upc, MAX(s.last_seen_at) AS last_seen_at, MIN(s.missed_uploads) AS missed_uploads, "
+            "MAX(s.last_file) AS last_file FROM dbo.source_upc_seen s "
+            "WHERE NOT EXISTS (SELECT 1 FROM dbo.raw_items r WHERE r.upc = s.upc) "
+            "AND EXISTS (SELECT 1 FROM dbo.items i WHERE i.upc = s.upc) GROUP BY s.upc"), conn)
+
+
+def _still_in(upcs, except_source: str, markers: dict) -> dict:
+    """{upc: [names of the other sources whose current file lists it]}."""
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    out = {u: [] for u in upcs}
+    for k in labels:
+        if k == except_source:
+            continue
+        have = load_raw_upcs(k, markers.get(k))
+        for u in out:
+            if u in have:
+                out[u].append(labels.get(k) or k)
+    return out
+
+
+def _gone_rows(seen: pd.DataFrame, extra_missed: int, still: dict) -> pd.DataFrame:
+    """The item-master rows for these seen-history rows, in list shape."""
+    fp = _items_fingerprint()
+    have = _item_upcs(fp)
+    keep = [u for u in seen["upc"] if u in have]
+    live = _items_by_upc(fp).loc[keep].reset_index().merge(seen.rename(columns={"upc": "UPC"}), on="UPC")
+    return pd.DataFrame({
+        "UPC": live["UPC"], "Description": live["Description"],
+        "Uploads missed": live["missed_uploads"] + extra_missed,
+        "Still in": live["UPC"].map(lambda u: ", ".join(still.get(u, []))),
+        "Last in a file": live["last_seen_at"].map(fmt_when), "Department": live["Department"], "Brand": live["Brand"],
+        "Last file": live["last_file"].fillna(""),
+        "_seen": live["last_seen_at"],
+    }).sort_values(["Uploads missed", "_seen"], ascending=[False, True]).drop(columns=["_seen"])
+
+
+def render_gone_items(source_key: str, source_name: str, cleaned_df: pd.DataFrame, key: str) -> None:
+    """Optional, and closed by default: the items this source's files used to
+    list that the new file doesn't — the ones that just dropped out and the
+    ones missing for a while — most uploads missed first. Only those no other
+    file has can be removed (never automatic; a Merge never removes anything)."""
+    markers = _upload_markers()
+    seen = load_seen_history(source_key, markers.get(source_key))
+    mine = seen[~dept_mapping.isin_fast(seen["upc"], cleaned_df["UPC"])]
+    if mine.empty:
+        st.caption(f"Every item {source_name}'s files have listed is in this file too.")
+        return
+    rows = _gone_rows(mine, 1, _still_in(mine["upc"], source_key, markers))  # (+1: this upload misses them too)
+    with st.expander(f"Not in this file · {len(rows):,} item-master item(s) {source_name}'s files listed before"):
+        if rows.empty:
+            st.caption("None of them is in the item master.")
+        else:
+            st.caption("Nothing is removed by saving — a Merge never removes an item. After saving, select any to "
+                       "remove on the Upload Reports tab.")
+            st.dataframe(rows, hide_index=True, width='stretch', height=min(320, 38 + 35 * len(rows)))
+
+
+def note_error(where: str, ex: BaseException) -> None:
+    """Record an error that was handled on the page (the person already saw a
+    plain message) so admins still see it under App errors."""
+    try:
+        dept_mapping.log_app_error(ENGINE, st.session_state.get("name"), where, ex)
+        load_app_errors.clear()
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------------
+# Upload Reports tab (editors and admins)
+#
+# Smooth by design: every part is its own fragment, so using one redraws only
+# that part; tick tables sit in a form, so ticking never reaches the server
+# (only the button does); each source's report is a tab and each duplicate
+# pair an expander, both already drawn, so switching / opening is instant.
+# -------------------------------------------------------------------
+REPORT_KIND_LABEL = {"baseline": "Baseline", "auto": "Monthly script", "manual": "Uploaded in the app"}
+REPORT_SHOW_MAX = 500
+
+COMBINE_FIELDS = [("Description", "Description"), ("Brand", "Brand"), ("Department", "Department"),
+                  ("Category", "Category"), ("Subcategory", "Subcategory"), ("Pack", "Pack"), ("Size", "Size"),
+                  ("UOM", "UOM"), ("Source", "SourceKey")]
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_upload_reports() -> pd.DataFrame:
+    """Every upload report kept (one row per report and source), newest first."""
+    return upload_reports.list_reports(ENGINE)
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def load_report_items(report_id: int, source_key: str) -> pd.DataFrame:
+    return upload_reports.report_items(ENGINE, report_id, source_key)
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_judged_pairs(fingerprint, markers) -> pd.DataFrame:
+    """The possible duplicate UPCs, each judged on every source's listing
+    (with why, in plain words, and each file's own line; sizes compared in
+    common units, within 10%)."""
+    return upload_reports.judge_pairs(ENGINE, load_duplicate_pairs(fingerprint))
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_not_duplicates() -> frozenset:
+    return frozenset(upload_reports.not_duplicates(ENGINE))
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _items_by_upc(fingerprint) -> pd.DataFrame:
+    """The item master by UPC, shared and read-only — for lookups (load_items
+    hands back a fresh copy of every row each call)."""
+    return load_items().set_index("UPC")
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _item_upcs(fingerprint) -> frozenset:
+    """Every UPC in the item master, shared and read-only."""
+    return frozenset(load_items()["UPC"])
+
+
+def _frag_toast() -> None:
+    """A message left by a part of the page that just redrew itself."""
+    msg = st.session_state.pop("_frag_toast", None)
+    if msg:
+        st.toast(msg)
+
+
+def _rerun_part() -> None:
+    """Redraw just this part of the page — or the whole page when the click came
+    in on a full run (a part can only redraw alone while it's redrawing alone)."""
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()
+
+
+def _frag_done(msg: str) -> None:
+    """Ends a quick action inside a fragment: redraw just that part, with a message."""
+    st.session_state["_frag_toast"] = msg
+    _rerun_part()
+
+
+def _rows_key(prefix: str, ids) -> str:
+    """A widget key naming the rows a table shows (see _pick_column)."""
+    return f"{prefix}_{hashlib.md5('|'.join(map(str, ids)).encode()).hexdigest()[:10]}"
+
+
+def _filter_rows(df: pd.DataFrame, q: str, cols: list) -> pd.DataFrame:
+    q = (q or "").strip().lower()
+    if not q or df.empty:
+        return df
+    blob = df[[c for c in cols if c in df.columns]].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+    return df[blob.str.contains(q, regex=False)]
+
+
+def _item_status(upcs: pd.Series, pending: dict) -> pd.Series:
+    """Where each UPC stands now: in the item master, staged, deleted, or still to come with the next Merge."""
+    have = _item_upcs(_items_fingerprint())
+    deleted = set(load_deleted_items()["upc"])
+    return upcs.map(lambda u: "Staged on Pending Changes" if u in pending else "In the item master" if u in have
+                    else "Deleted" if u in deleted else "Comes in with the next Merge")
+
+
+def _tick_form(view: pd.DataFrame, key: str, label: str, button: str, help_: str, note: str, disabled: bool = False) -> tuple:
+    """A tick table in a form: ticking stays in the browser (nothing reloads);
+    only the button sends the ticks. Returns (ticked UPCs, button pressed)."""
+    with st.form(f"{key}_form", border=False, enter_to_submit=False):
+        picked = _pick_column(view, key, label, help_=help_)
+        c1, c2 = st.columns([2, 3], vertical_alignment="center")
+        pressed = c1.form_submit_button(button, type="primary", width='stretch', key=f"{key}_submit", disabled=disabled)
+        c2.caption(note)
+    return picked, pressed
+
+
+def render_remove_lists(rows: pd.DataFrame, key: str, where: str) -> None:
+    """Two lists, most out of date first: items no current file has (tick to
+    stage removing them — never automatic) and items another source's file
+    still has (shown for comparison, can't be removed). rows: UPC, Description,
+    Department, Brand, Uploads missed, Last in a file, Last file, Still in."""
+    removable = rows[rows["Still in"] == ""].drop(columns=["Still in"])
+    locked = rows[rows["Still in"] != ""]
+    pending = load_item_master_pending()
+    st.caption("Nothing is removed unless you select it here and push it on Pending Changes. Removed items stay "
+               "under Deleted Items, so they can be restored. An item another source's file still has can't be removed.")
+    st.markdown(f"**Select to remove** · {len(removable):,} item(s) no current file has")
+    if removable.empty:
+        st.caption("None — every one of them is still in another source's file.")
+    else:
+        view = removable.assign(Staged=removable["UPC"].map(lambda u: "Staged" if u in pending else ""))
+        view = view[["UPC", "Staged"] + [c for c in view.columns if c not in ("UPC", "Staged")]]
+        picked, pressed = _tick_form(view, f"{key}_gone_grid", "Remove", "Stage removing",
+                                     "Select to stage removing it", "Tick the ones to remove, then stage them.")
+        if pressed:
+            picked = [u for u in picked if u not in pending]
+            if not picked:
+                st.toast("Tick at least one item that isn't staged already.")
+            else:
+                stage_deletes(picked, where, fragment=True)
+    if not locked.empty:
+        st.markdown(f"**Still in another source's file** · {len(locked):,} — can't be removed")
+        st.dataframe(locked.astype(object).where(locked.notna(), ""), hide_index=True, width='stretch', height=min(320, 38 + 35 * len(locked)))
+
+
+def render_report_added(rid: int, sk: str, name: str, editable: bool, shortcuts: bool = False) -> None:
+    """A report's new items for one source — tick to delete (current report only)."""
+    added = load_report_items(rid, sk)
+    added = added[added["kind"] == "A"]
+    if added.empty:
+        st.caption(f"This upload brought no new items for {name}.")
+        return
+    if shortcuts:
+        render_needs_decision(list(added["upc"]), f"rep_{rid}_{sk}")
+    pending = load_item_master_pending()
+    q = st.text_input("Filter", key=f"rep_add_q_{'cur' if editable else 'hist'}_{rid}_{sk}", label_visibility="collapsed",
+                      placeholder="Filter by UPC, description, brand or department…")
+    view = _filter_rows(added, q, ["upc", "description", "brand", "department"])
+    if view.empty:
+        st.info("Nothing matches that filter.")
+        return
+    shown = view.head(REPORT_SHOW_MAX)
+    items = _items_by_upc(_items_fingerprint())
+    live = items.reindex(shown["upc"].values)  # (one lookup for the rows shown; blank where it's not in the item master)
+    have = _item_upcs(_items_fingerprint())
+    there = [u_ in have for u_ in shown["upc"].values]  # (a set lookup — pandas' isin on 330k UPCs is slow)
+    pick = lambda col, saved: [(_txt(v) if ok else _txt(s_)) for v, ok, s_ in zip(live[col].values, there, saved)]
+    table = pd.DataFrame({
+        "UPC": shown["upc"].values,
+        "Now": _item_status(shown["upc"], pending).values,
+        "Description": pick("Description", shown["description"]),
+        "Brand": pick("Brand", shown["brand"]),
+        "Department": pick("Department", shown["department"]),
+    }, index=shown.index)
+    table = with_lookalikes(table, None)
+    if len(view) > REPORT_SHOW_MAX:
+        st.caption(f"{len(view):,} items — showing the first {REPORT_SHOW_MAX:,}. Filter to find others.")
+    if not editable:
+        st.dataframe(table, hide_index=True, width='stretch', height=min(420, 38 + 35 * len(table)))
+        return
+    can = (table["Now"] == "In the item master").any()
+    picked, pressed = _tick_form(table, f"rep_add_grid_{rid}_{sk}", "Delete", "Stage deleting",
+                                 "Tick to stage deleting it",
+                                 "Only items already in the item master can be deleted (see “Now”)." if can else
+                                 "Nothing to delete yet — these come in with the next Merge.", disabled=not can)
+    if pressed:
+        now = dict(zip(table["UPC"], table["Now"]))
+        ok = [u for u in picked if now.get(u) == "In the item master"]
+        if not picked:
+            st.toast("Tick at least one item first.")
+        elif not ok:
+            st.toast("None of the ticked items is in the item master yet — they come in with the next Merge.")
+        else:
+            stage_deletes(ok, f"Upload Reports — new from {name}", fragment=True,
+                          note=(f" ({len(picked) - len(ok):,} not in the item master yet were left)" if len(ok) < len(picked) else ""))
+
+
+def render_report_dropped(rid: int, sk: str, name: str, editable: bool) -> None:
+    """What dropped out of a source's file. In the current report: everything its
+    files used to list that the latest one doesn't (most uploads missed first),
+    selectable to remove; in an older report: what that upload dropped, as it was."""
+    if not editable:
+        gone = load_report_items(rid, sk)
+        gone = gone[gone["kind"] == "R"]
+        if gone.empty:
+            st.caption(f"Nothing dropped out of {name}'s file with this upload.")
+            return
+        q = st.text_input("Filter", key=f"rep_drop_q_{rid}_{sk}", label_visibility="collapsed",
+                          placeholder="Filter by UPC, description, brand or department…")
+        view = _filter_rows(gone, q, ["upc", "description", "brand", "department"]).head(REPORT_SHOW_MAX)
+        st.dataframe(pd.DataFrame({"UPC": view["upc"], "Description": view["description"].fillna(""),
+                                   "Brand": view["brand"].fillna(""), "Department": view["department"].fillna(""),
+                                   "Now": _item_status(view["upc"], load_item_master_pending())}),
+                     hide_index=True, width='stretch', height=min(420, 38 + 35 * max(len(view), 1)))
+        return
+    markers = _upload_markers()
+    seen = load_seen_history(sk, markers.get(sk))
+    gone = seen[seen["missed_uploads"] >= 1]
+    if gone.empty:
+        st.caption(f"Every item {name}'s files have listed is in its latest file.")
+        return
+    rows = _gone_rows(gone, 0, _still_in(gone["upc"], sk, markers))
+    if rows.empty:
+        st.caption(f"{len(gone):,} item(s) dropped out of {name}'s file, but none of them is in the item master.")
+        return
+    just = set(load_report_items(rid, sk).query("kind == 'R'")["upc"])
+    never = len(just - set(rows["UPC"]))
+    if never:
+        st.caption(f"{never:,} of the {len(just):,} this upload dropped never came into the item master (they were "
+                   "only in an earlier file, before a Merge), so there's nothing to remove for them.")
+    rows.insert(2, "This upload", rows["UPC"].map(lambda u: "Dropped now" if u in just else ""))
+    render_remove_lists(rows, f"rep_gone_{sk}", f"Upload Reports — not in {name}'s file")
+
+
+@st.fragment
+def render_report_source(reports: pd.DataFrame, rid: int, sk: str, editable: bool) -> None:
+    """One source's part of a report: its new items and what dropped out."""
+    _frag_toast()
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    name = labels.get(sk) or sk
+    row = reports[(reports["report_id"] == rid) & (reports["source_key"] == sk)].iloc[0]
+    st.caption(f"{_txt(row['filename']) or '(no file name)'} · {REPORT_KIND_LABEL.get(row['kind'], row['kind'])} "
+               f"{fmt_when(row['created_at'])}" + (f" by {row['created_by']}" if row["created_by"] else "")
+               + f" · report #{rid}")
+    t_add, t_drop = st.tabs([f"New items ({int(row['n_added'] or 0):,})",
+                             f"Not in the file ({int(row['n_removed'] or 0):,} dropped with this upload)"])
+    with t_add:
+        # (shortcuts for an upload's new items — not the baseline, whose "new items" are everything)
+        render_report_added(rid, sk, name, editable, shortcuts=editable and row["kind"] != "baseline")
+    with t_drop:
+        render_report_dropped(rid, sk, name, editable)
+
+
+def render_report_sources(reports: pd.DataFrame, pairs: list, editable: bool) -> None:
+    """pairs: [(source, report id)] — a tab per source, all drawn already, so
+    switching is instant."""
+    if not pairs:
+        st.caption("No sources in this report.")
+        return
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    tabs = st.tabs([labels.get(sk) or sk for sk, _ in pairs])
+    for tab, (sk, rid) in zip(tabs, pairs):
+        with tab:
+            render_report_source(reports, rid, sk, editable)
+
+
+def _item_card_html(item, differs: set) -> str:
+    """One item's fields as a two-column list; the fields that differ from the
+    other item are highlighted."""
+    names = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    rows = []
+    for label, col in COMBINE_FIELDS:
+        v = _txt(item[col])
+        if col == "SourceKey" and v:
+            v = names.get(v) or v
+        shown = html.escape(v) if v else "<span class='dup-none'>—</span>"
+        if label in differs:
+            shown = f"<span class='dup-diff'>{shown}</span>"
+        rows.append(f"<div class='dup-lbl'>{label}</div><div class='dup-val'>{shown}</div>")
+    return "<div class='dup-grid'>" + "".join(rows) + "</div>"
+
+
+def render_combine_card(p, items: pd.DataFrame, in_files: dict) -> None:
+    """Two items that look like one, side by side: keep one. Fields that differ
+    are highlighted; when only the UPC differs, it's just which UPC to keep."""
+    sh, lg = p["UPC (shorter)"], p["UPC (longer)"]
+    a, b = items.loc[sh], items.loc[lg]
+    differs = {label for label, col in COMBINE_FIELDS if _txt(a[col]).upper() != _txt(b[col]).upper()}
+    order = sorted([lg, sh], key=lambda u_: -len(in_files[u_]))  # the UPC more files list is usually the right code
+    # The cards: each item as it is in the item master now (after Department
+    # Review, overrides and every pushed change) — what you'd keep. The files'
+    # own wording only explains the verdict, one line, with the detail a click away.
+    c_why, c_pop = st.columns([5, 1.7], vertical_alignment="center")
+    shown_v = "Looks different" if p["Verdict"] == "Different" else p["Verdict"]
+    c_why.markdown(f"<div class='dup-why'><b>Why “{html.escape(shown_v)}”:</b> {html.escape(p['Why'])}</div>",
+                   unsafe_allow_html=True)
+    with c_pop.popover("What the files say", width='stretch'):
+        names = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+        st.markdown("<span class='dup-files'></span>", unsafe_allow_html=True)
+        st.caption("Each file's own line for these UPCs, before any clean-up — what the verdict is based on.")
+        for u_ in order:
+            lines = p["Lines (shorter)"] if u_ == sh else p["Lines (longer)"]
+            st.markdown(f"**{u_}**")
+            if not lines:
+                st.caption("No current file lists it.")
+                continue
+            st.dataframe(pd.DataFrame([(names.get(k) or k, d, b_, s_) for k, d, b_, s_ in lines],
+                                      columns=["File", "Description", "Brand", "Size"]),
+                         hide_index=True, width='stretch', height=38 + 35 * len(lines))
+    st.caption("The cards show each item as it is in the item master now — what you'd keep. Keep one: all of its "
+               "information stays; the other is removed, and stays out even when a file lists it again."
+               + (" Highlighted: where they differ." if differs else " Only the UPC differs; everything else is the same."))
+    cols = st.columns(2)
+    for col_, u_ in zip(cols, order):
+        it, other = (a, lg) if u_ == sh else (b, sh)
+        with col_.container(border=True, key=f"dup_side_{sh}_{lg}_{u_}"):
+            n = len(in_files[u_])
+            st.markdown(f"<div class='dup-upc'>{u_}</div>", unsafe_allow_html=True)
+            st.caption(f"In {n} file(s): {', '.join(in_files[u_])}" if n else "No current file lists it")
+            st.markdown(_item_card_html(it, differs), unsafe_allow_html=True)
+            if st.button("Keep this one", key=f"dup_keep_{sh}_{lg}_{u_}", width='stretch',
+                         type="primary" if u_ == order[0] else "secondary",
+                         help=f"Keeps {u_} as it is and removes {other} (staged on Pending Changes)."):
+                stage_deletes([other], "Upload Reports — combine duplicates", {other: u_}, fragment=True)
+    c1, c2 = st.columns([1.4, 4], vertical_alignment="center")
+    if c1.button("Not the same item", key=f"dup_not_same_{sh}_{lg}", width='stretch'):
+        upload_reports.mark_not_duplicate(ENGINE, [(sh, lg)], st.session_state["name"])
+        activity("Items", "Marked a possible duplicate as two different items", f"{sh} / {lg}", 1)
+        load_not_duplicates.clear()
+        _frag_done(f"{sh} and {lg} are kept as two items, and won't be listed again.")
+    c2.caption("Keeps both as separate items and takes the pair off this list.")
+
+
+def render_combined_list() -> None:
+    """Every duplicate combined so far — each can be undone at any time: undoing
+    puts the removed item back exactly as it was, as its own item again."""
+    deleted = load_deleted_items()
+    combined = deleted[deleted["combined_into"].notna()] if "combined_into" in deleted.columns else deleted.iloc[0:0]
+    pending = load_item_master_pending()
+    staged = {u: c["combined_into"] for u, c in pending.items() if c.get("combined_into")}
+    if combined.empty and not staged:
+        return
+    with st.expander(f"Combined · {len(combined):,}" + (f" (+{len(staged):,} staged)" if staged else ""),
+                     key="dup_combined_exp"):
+        if staged:
+            st.caption(f"{len(staged):,} combine(s) staged and not pushed yet — take one back with Undo on Pending Changes.")
+        if combined.empty:
+            return
+        st.caption("Undo puts the removed item back straight away, exactly as it was, as its own item again (and the "
+                   "pair is listed above for review). Any combine can be undone, any time — they're never cleared.")
+        have = _item_upcs(_items_fingerprint())
+        view = pd.DataFrame({
+            "UPC": combined["upc"], "Description": combined["description"].fillna(""),
+            "Combined into": combined["combined_into"],
+            "Kept item": combined["combined_into"].map(lambda k: "in the item master" if k in have else "no longer in the item master"),
+            "When": combined["deleted_at"].map(fmt_when), "By": combined["deleted_by"].fillna(""),
+            "Department": combined["department"].fillna(""), "Brand": combined["brand"].fillna(""),
+        }, index=combined.index)
+        picked, pressed = _tick_form(view, "dup_combined_grid", "Undo", "Undo combine",
+                                     "Tick to undo this combine", "Tick the ones to undo.")
+        if pressed:
+            if not picked:
+                st.toast("Tick at least one combine first.")
+                return
+            by = combined.set_index("upc")
+            with st.spinner(f"Undoing {len(picked):,} combine(s)..."):
+                for u_ in picked:
+                    restore_as_saved(u_, by.loc[u_])
+                    activity("Items", f"Undid a combine (was combined into {by.loc[u_, 'combined_into']})", u_, 1)
+                clear_items_cache(picked)
+                load_deleted_items.clear()
+                load_manual_items.clear()
+            _frag_done(f"Undid {len(picked):,} combine(s) — the item(s) are back as they were.")
+
+
+DUP_ORDER = ["Same item", "Likely same", "Unsure", "Different"]  # most likely first
+DUP_LABEL = {"Same item": ":green-badge[Same item]", "Likely same": ":blue-badge[Likely same]",
+             "Unsure": ":orange-badge[Unsure]", "Different": ":gray-badge[Looks different]"}
+DUP_PER_PAGE = 10
+
+
+def _open_dup_pairs() -> tuple:
+    """(the pairs to review, how many are being removed already) — every pair
+    whose digits line up, apart from made-up codes, pairs marked as two items,
+    and pairs where one item is already staged to be deleted or combined. (A
+    pair with other staged work stays listed; combining it says whose work.)"""
+    pairs = load_judged_pairs(_items_fingerprint(), tuple(sorted(_upload_markers().items())))
+    if pairs.empty:
+        return pairs, 0
+    pairs = pairs[pairs["Verdict"] != "Placeholder code"]
+    nd = load_not_duplicates()
+    pending = load_item_master_pending()
+    is_nd = pd.Series([(a, b) in nd for a, b in zip(pairs["UPC (shorter)"], pairs["UPC (longer)"])], index=pairs.index, dtype=bool)
+    going = {u_ for u_, c in pending.items() if c["change_type"] == "delete"}
+    staged = pairs["UPC (shorter)"].isin(going) | pairs["UPC (longer)"].isin(going)
+    out = pairs[~is_nd & ~staged]
+    out = out.assign(_o=out["Verdict"].map(lambda v: DUP_ORDER.index(v) if v in DUP_ORDER else 9)).sort_values("_o", kind="stable")
+    return out, int(staged.sum())
+
+
+def _dup_page(delta: int, n_pages: int) -> None:
+    st.session_state["dup_page"] = max(0, min(n_pages - 1, st.session_state.get("dup_page", 0) + delta))
+
+
+def _dup_pager(where: str, page: int, n_pages: int, text_: str) -> None:
+    """‹ Previous · where you are · Next › (at the top and the bottom of the list)."""
+    small = where == "top"
+    p1, p2, p3 = st.columns([0.6, 2, 0.6] if small else [1, 2.2, 1], vertical_alignment="center")
+    p1.button("‹" if small else "‹ Previous", key=f"dup_prev_{where}", width='stretch', disabled=page == 0,
+              on_click=_dup_page, args=(-1, n_pages), help="Previous page" if small else None)
+    p2.markdown(f"<div style='text-align:center;opacity:.75;font-size:.9rem;white-space:nowrap'>{text_}</div>",
+                unsafe_allow_html=True)
+    p3.button("›" if small else "Next ›", key=f"dup_next_{where}", width='stretch', disabled=page >= n_pages - 1,
+              on_click=_dup_page, args=(1, n_pages), help="Next page" if small else None)
+
+
+@st.fragment
+def render_duplicate_review() -> None:
+    """Possible duplicate UPCs, a page at a time: each pair opens in place
+    (already drawn, so instantly) with both items side by side. The verdict is
+    a hint only — nothing is ruled out; both stay as two items until a person
+    combines them or says they're different."""
+    _frag_toast()
+    view_all, n_staged = _open_dup_pairs()
+    counts = view_all["Verdict"].value_counts().to_dict() if not view_all.empty else {}
+    st.caption("Two UPCs with the same digits apart from one at the front — often a file that dropped a UPC's first "
+               "digit (e.g. 1029100797 and 81029100797), sometimes two different products. Each is labelled with how "
+               "alike the files say they are, most alike first; the label is only a hint. Open one to compare and decide.")
+    q = st.text_input("Filter pairs", key="dup_filter", label_visibility="collapsed",
+                      placeholder="Filter by UPC, description or file…")
+    view = _filter_rows(view_all, q, ["UPC (shorter)", "UPC (longer)", "Description (shorter)", "Description (longer)",
+                                      "Files (shorter)", "Files (longer)"])
+    if n_staged:
+        st.caption(f"{n_staged:,} pair(s) with an item already staged to be deleted or combined are left out until "
+                   "that's pushed (or taken back on Pending Changes).")
+    if view.empty:
+        st.info("No pairs match that filter." if q.strip() else "No possible duplicate UPCs right now.")
+    else:
+        n_pages = max(1, -(-len(view) // DUP_PER_PAGE))
+        if st.session_state.get("_dup_q") != q:  # a new filter starts at its first page
+            st.session_state["_dup_q"], st.session_state["dup_page"] = q, 0
+        page = min(st.session_state.get("dup_page", 0), n_pages - 1)
+        start = page * DUP_PER_PAGE
+        rows = view.iloc[start:start + DUP_PER_PAGE]
+        where_ = f"{start + 1:,}–{start + len(rows):,} of {len(view):,} · page {page + 1} of {n_pages}"
+        c_l, c_p = st.columns([2.2, 1], vertical_alignment="center")
+        c_l.markdown(" &nbsp; ".join(f"{DUP_LABEL[v]} {counts.get(v, 0)}" for v in DUP_ORDER))
+        if n_pages > 1:
+            with c_p:
+                _dup_pager("top", page, n_pages, f"page {page + 1} of {n_pages}")
+        items = _items_by_upc(_items_fingerprint())
+        labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+        markers = _upload_markers()
+        have = {k: load_raw_upcs(k, markers.get(k)) for k in labels}
+        for _, p in rows.iterrows():
+            sh, lg = p["UPC (shorter)"], p["UPC (longer)"]
+            in_files = {u_: [labels.get(k) or k for k in labels if u_ in have[k]] for u_ in (sh, lg)}
+            desc = _txt(items.loc[lg, "Description"]) or _txt(items.loc[sh, "Description"])
+            title = f"{DUP_LABEL.get(p['Verdict'], p['Verdict'])} **{sh}** ⇄ **{lg}** · {desc[:70]}"
+            with st.expander(title, key=f"dup_exp_{sh}_{lg}"):
+                render_combine_card(p, items, in_files)
+        if n_pages > 1:
+            _dup_pager("bottom", page, n_pages, where_)
+    # new items still to come in (a Merge brings them in; combine after that)
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    have_items = _item_upcs(_items_fingerprint())
+    waiting = []
+    for sk, rid in upload_reports.current_report_ids(load_upload_reports()).items():
+        a_ = load_report_items(rid, sk)
+        a_ = a_[(a_["kind"] == "A") & ~a_["upc"].map(have_items.__contains__)]
+        if a_.empty:
+            continue
+        for u, other in dept_mapping.lookalike_upcs(a_["upc"], have_items).items():
+            waiting.append({"New UPC": u, "From": labels.get(sk) or sk, "Looks like": other,
+                            "Description": _txt(a_.set_index("upc").loc[u, "description"])})
+    if waiting or not load_deleted_items()["combined_into"].isna().all() or load_not_duplicates():
+        st.divider()
+    if waiting:
+        with st.expander(f"Coming in with the next Merge · {len(waiting):,}", key="dup_waiting_exp"):
+            st.caption("New items that look like one already there. They come in as their own items; once the Merge "
+                       "has brought them in, they're listed above to compare.")
+            st.dataframe(pd.DataFrame(waiting), hide_index=True, width='stretch', height=min(320, 38 + 35 * len(waiting)))
+    render_combined_list()
+    nd = load_not_duplicates()
+    if nd:
+        with st.expander(f"Marked as two different items · {len(nd):,}", key="dup_nd_exp"):
+            nd_df = pd.DataFrame(sorted(nd), columns=["UPC", "Other UPC"])
+            picked, pressed = _tick_form(nd_df, "dup_nd_grid", "Put back", "Put back on the list",
+                                         "Tick to list this pair for review again", "")
+            if pressed and picked:
+                pair_of = dict(zip(nd_df["UPC"], nd_df["Other UPC"]))
+                for a_ in picked:
+                    upload_reports.undo_not_duplicate(ENGINE, a_, pair_of[a_])
+                load_not_duplicates.clear()
+                _frag_done(f"Put {len(picked):,} pair(s) back on the list.")
+
+
+def is_placeholder_upc(u: str) -> bool:
+    """A made-up code, not a product's barcode: only 9s and 0s, with a run of
+    9s (e.g. 9999999999, 99999900000). (Codes that just start 99999 are a file's own item numbers —
+    one per product, so they're not this.)"""
+    return len(u) >= 6 and set(u) <= {"9", "0"} and "99999" in u
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def _placeholder_upcs(fingerprint) -> list:
+    """The item master's made-up UPCs (worked out once per version of it)."""
+    return sorted(u_ for u_ in _item_upcs(fingerprint) if is_placeholder_upc(u_))
+
+
+@st.fragment
+def render_placeholder_upcs() -> None:
+    """Items whose UPC is a made-up code. Files use these for items with no real
+    barcode, so unrelated products share one code — the item master keeps
+    whichever came in first. Not duplicates; delete them or leave them."""
+    _frag_toast()
+    items = _items_by_upc(_items_fingerprint())
+    ph = _placeholder_upcs(_items_fingerprint())
+    if not ph:
+        st.caption("No item in the item master has a made-up UPC.")
+        return
+    st.caption("Made-up codes like 9999999999 — files use them for items that have no real barcode (deli trays, in-store "
+               "items), so several unrelated products can share one. The item master keeps only one item per UPC, so "
+               "each of these holds whichever product came in first. They aren't duplicates: delete the ones you don't "
+               "want, or leave them. For good, ask the source to send real UPCs.")
+    markers = _upload_markers()
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    n_rows = {}
+    for k in labels:
+        in_file = load_raw_upcs(k, markers.get(k))  # (once per source: each call hands back a copy of the whole set)
+        for u_ in ph:
+            if u_ in in_file:
+                n_rows.setdefault(u_, []).append(labels.get(k) or k)
+    rows = items.loc[ph].reset_index()
+    pending = load_item_master_pending()
+    view = pd.DataFrame({"UPC": rows["UPC"], "Staged": rows["UPC"].map(lambda u_: "Staged" if u_ in pending else ""),
+                         "Description": rows["Description"].map(_txt),
+                         "Department": rows["Department"].map(_txt), "Source": rows["SourceKey"].map(lambda k: labels.get(k) or _txt(k)),
+                         "In files": rows["UPC"].map(lambda u_: ", ".join(n_rows.get(u_, [])))}, index=rows.index)
+    picked, pressed = _tick_form(view, "ph_grid", "Delete", "Stage deleting",
+                                 "Tick to stage deleting it", "A file that still lists one brings it back with its next upload.")
+    if pressed:
+        picked = [u_ for u_ in picked if u_ not in pending]
+        if not picked:
+            st.toast("Tick at least one item that isn't staged already.")
+        else:
+            stage_deletes(picked, "Upload Reports — placeholder UPC", fragment=True)
+
+
+@st.fragment
+def render_report_history(reports: pd.DataFrame, current: dict) -> None:
+    """Every report kept (a year), view only — select one to see what it added and dropped."""
+    _frag_toast()
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    g = reports.groupby("report_id", sort=False)
+    ids = list(g.groups)
+    hist = pd.DataFrame({
+        "Report": [f"#{rid}" for rid in ids],
+        "When": [fmt_when(df_["created_at"].iloc[0]) for _, df_ in g],
+        "How": [_report_how(df_) for _, df_ in g],
+        "By": [_txt(df_["created_by"].iloc[0]) for _, df_ in g],
+        "Sources": [", ".join(labels.get(k) or k for k in df_["source_key"].dropna()) for _, df_ in g],
+        "New items": [int(df_["n_added"].fillna(0).sum()) for _, df_ in g],
+        "Dropped out": [int(df_["n_removed"].fillna(0).sum()) for _, df_ in g],
+        "Current for": [", ".join(labels.get(k) or k for k, v in current.items() if v == rid) for rid in ids],
+    })
+    st.caption(f"{len(ids):,} report(s) from the last year (older ones are cleared; a source's latest is always kept). "
+               "View only — act on the latest under Latest uploads.")
+    ev = st.dataframe(hist, hide_index=True, width='stretch', height=min(320, 38 + 35 * len(hist)),
+                      on_select="rerun", selection_mode="single-row", key=_rows_key("rep_hist", ids),
+                      column_order=["Report", "When", "How", "New items", "Dropped out", "Sources", "By", "Current for"],
+                      column_config={**{c: st.column_config.NumberColumn(format="localized", width="small")
+                                        for c in ("New items", "Dropped out")},
+                                     "Report": st.column_config.TextColumn(width="small")})
+    sel = ev.selection.rows if ev is not None else []
+    if not sel:
+        st.caption("Select a report to see what it added and dropped.")
+        return
+    rid = int(ids[sel[0]])
+    with st.container(border=True, key="rep_hist_detail"):
+        st.markdown(f"**Report #{rid}**" + (" — the latest for some sources; act on it under Latest uploads" if rid in set(current.values()) else ""))
+        mine = reports[(reports["report_id"] == rid) & reports["source_key"].notna()]
+        render_report_sources(reports, [(sk, rid) for sk in mine["source_key"]], editable=False)
+
+
+@st.fragment
+def render_stale_items() -> None:
+    """Items no current file has (from any source), most uploads missed first —
+    to clean out stale items whenever it's worth doing."""
+    _frag_toast()
+    gone = load_stale_seen(tuple(sorted(_upload_markers().items())))
+    if gone.empty:
+        st.caption("Every item in the item master is in at least one source's current file (or was added by hand).")
+        return
+    rows = _gone_rows(gone, 0, {})
+    st.caption("In the item master, but no source's current file lists them — most uploads missed first. "
+               "They stay unless you remove them.")
+    render_remove_lists(rows, "stale", "Upload Reports — no file has it")
+
+
+def _report_how(rows: pd.DataFrame) -> str:
+    """How a report's upload came in, in a few words."""
+    kind, title = rows["kind"].iloc[0], _txt(rows["title"].iloc[0])
+    if kind == "baseline":
+        return "Baseline"
+    if kind == "auto":
+        return "Monthly script"
+    if title.startswith("This month"):
+        return "All files at once (app)"
+    return title.replace(" (uploaded in the app)", " (app)") if title.endswith("(uploaded in the app)") else "In the app"
+
+
+def render_upload_reports_tab() -> None:
+    """The Upload Reports tab (editors and admins), in tabs: each source's
+    latest upload (what it added and what dropped out, to act on), possible
+    duplicate UPCs to compare and combine, placeholder UPCs, items no file has
+    any more, and the year's reports to look back at."""
+    st.subheader("Upload Reports")
+    st.caption("What each upload brought in and dropped, and what to clean up after it. Only each source's latest "
+               "upload can be acted on; older reports are kept a year to look back at.")
+    reports = load_upload_reports()
+    current = upload_reports.current_report_ids(reports)
+    labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
+    n_dup = len(_open_dup_pairs()[0])
+    n_ph = len(_placeholder_upcs(_items_fingerprint()))
+    n_stale = len(load_stale_seen(tuple(sorted(_upload_markers().items()))))
+    t_cur, t_dup, t_ph, t_stale, t_hist = st.tabs([
+        "Latest uploads", f"Possible duplicate UPCs ({n_dup:,})", f"Placeholder UPCs ({n_ph:,})",
+        f"No file has these ({n_stale:,})", "History"])
+    with t_cur:
+        order = sorted(current.items(), key=lambda kv: -kv[1])
+        rows = []
+        for sk, rid in order:
+            r = reports[(reports["report_id"] == rid) & (reports["source_key"] == sk)].iloc[0]
+            rows.append({"Source": labels.get(sk) or sk, "File": _txt(r["filename"]), "When": fmt_when(r["created_at"]),
+                         "How": _report_how(reports[reports["report_id"] == rid]), "New items": int(r["n_added"] or 0),
+                         "Dropped out": int(r["n_removed"] or 0), "Report": f"#{rid}"})
+        if not rows:
+            st.caption("No uploads yet.")
+        else:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch',
+                         column_order=["Source", "New items", "Dropped out", "When", "How", "File", "Report"],
+                         column_config={**{c: st.column_config.NumberColumn(format="localized", width="small")
+                                           for c in ("New items", "Dropped out")},
+                                        "File": st.column_config.TextColumn(width="medium"),
+                                        "Report": st.column_config.TextColumn(width="small")})
+            render_report_sources(reports, order, editable=True)
+    with t_dup:
+        render_duplicate_review()
+    with t_ph:
+        render_placeholder_upcs()
+    with t_stale:
+        render_stale_items()
+    with t_hist:
+        render_report_history(reports, current)
+
+
 def render_upload_ingest_tab() -> None:
-    """The Upload & Ingest tab."""
-    st.subheader("Upload a distributor file")
+    """The Upload & Ingest tab: where every source stands, the two ways to
+    bring a file in (one source, or the whole month at once), and every
+    upload so far."""
+    st.subheader("Upload & Ingest")
     st.caption(
-        "A new file replaces that source's rows. Every upload is logged below.",
+        "Each upload updates that source's copy of its file. A Merge then adds only items that aren't in the item "
+        "master yet — existing items are never changed.",
         help=("Do this every month when a new file comes in for a source — the new file's rows "
-        "REPLACE that source's previously staged rows. Every upload is logged permanently "
-        "below, with an explanation for anything dropped, not just the first time."),
+              "REPLACE that source's previously staged rows. Saving one computes a fresh Merge draft; "
+              "the Merge tab is where it's reviewed and pushed. Every upload is logged permanently "
+              "below, with an explanation for anything dropped."),
     )
     render_auto_merge_result(st.session_state.pop("_upload_auto_merge_result", None))
-    render_monthly_refresh()
+    msgs = st.session_state.get("_upload_push_msgs")
+    if msgs:
+        with st.container(border=True, key="upload_push_result"):
+            c1, c2 = st.columns([6, 1], vertical_alignment="center")
+            c1.markdown("**Last upload**")
+            if c2.button("Dismiss", key="upload_push_result_dismiss", width='stretch'):
+                st.session_state.pop("_upload_push_msgs", None)
+                st.session_state.pop("_upload_new_upcs", None)
+                st.rerun()
+            for kind, text_ in msgs:
+                getattr(st, kind)(text_)
+            render_needs_decision(st.session_state.get("_upload_new_upcs") or [], "upload")
     sources_df = load_sources()
     if sources_df.empty:
         st.info("No sources configured yet — add one on the Sources tab first.")
-    else:
-        counts_df = load_raw_item_counts()
-        total_staged = int(counts_df["row_count"].sum()) if not counts_df.empty else 0
-        st.caption(f"{total_staged} total rows staged across {len(counts_df)} of {len(sources_df)} source(s).")
-        with st.expander("View staged row counts per source"):
-            st.dataframe(counts_df, width='stretch', hide_index=True)
+        return
+    labels = dict(zip(sources_df["source_key"], sources_df["source_label"]))
+    counts = load_raw_item_counts().set_index("source_key") if not load_raw_item_counts().empty else pd.DataFrame()
+    log_all = load_ingestion_log()
+    latest = log_all.drop_duplicates("source_key").set_index("source_key") if not log_all.empty else pd.DataFrame()
+    stale = set(load_stale_sources())
 
-        source_key_choice = st.selectbox("Source", sources_df["source_key"].tolist())
-        source_series = sources_df[sources_df["source_key"] == source_key_choice].iloc[0]
-        source_row = {col: sql_value(source_series[col]) for col in source_series.index}
-        uploaded_file = st.file_uploader(
-            f"Upload the file for '{source_row['source_label']}'",
-            type=["xlsx", "xls", "xlsb", "csv"],
-        )
+    # ---- where every source stands ------------------------------------------
+    rows = []
+    for _, src in sources_df.iterrows():
+        k = src["source_key"]
+        last = latest.loc[k] if k in latest.index else None
+        rows.append({
+            "Source": f"{src['source_label'] or k} ({k})",
+            "Rows now": int(counts.loc[k, "row_count"]) if k in counts.index else 0,
+            "Last upload": fmt_when(last["uploaded_at"]) if last is not None else "never",
+            "By": (last["uploaded_by"] or "") if last is not None else "",
+            "File": (last["original_filename"] or "") if last is not None else "",
+            "In the item master": ("not yet — newer than the last Merge" if k in stale else "yes") if last is not None else "",
+            "Enabled": bool(src["enabled"]),
+        })
+    total = sum(r["Rows now"] for r in rows)
+    st.markdown(f"**Sources** · {total:,} rows across {sum(1 for r in rows if r['Rows now'])} of {len(rows)}")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch',
+                 column_config={"Rows now": st.column_config.NumberColumn(format="localized"),
+                                "Enabled": st.column_config.CheckboxColumn(width="small")})
+    if stale and is_admin:
+        c1, c2 = st.columns([5, 1.2], vertical_alignment="center")
+        c1.caption(f"{', '.join(sorted(stale))} changed since the last Merge — compute and push one to bring it in.")
+        if c2.button("Go to Merge", key="upload_goto_merge", width='stretch'):
+            st.session_state["_nav_to_tab"] = "Merge"
+            st.rerun()
 
-        if uploaded_file is not None:
-            try:
-                raw_df = read_raw_file(uploaded_file, source_row)
-                cleaned_df, stats, rejected_df = map_and_clean(raw_df, source_row)
-                st.success(
-                    f"Parsed {stats['rows_parsed']} raw rows → {stats['rows_staged']} valid, unique-UPC rows "
-                    f"({stats['dropped_invalid_upc']} invalid UPC, {stats['dropped_duplicate_upc']} duplicate UPC dropped)."
-                )
-                st.dataframe(cleaned_df.head(20), width='stretch', hide_index=True)
+    # ---- bring a file in ----------------------------------------------------
+    st.markdown("")
+    render_uploads()
+    st.caption("What each upload added and dropped — and possible duplicates to combine — are on the Upload Reports tab.")
 
-                if st.button(f"Save {len(cleaned_df)} rows to raw_items for '{source_key_choice}'", type="primary"):
-                    stage_source(
-                        ENGINE, source_key_choice, cleaned_df, rejected_df, stats,
-                        uploaded_by=st.session_state["name"],
-                        original_filename=uploaded_file.name,
-                        on_retry=_warn_retrying,
-                    )
-                    # Keeps the as-read file around so a later column-
-                    # mapping fix on the Sources tab (e.g. adding a Pack/
-                    # Size Column) can be re-run against it without
-                    # asking for the same file again.
-                    save_raw_upload(ENGINE, source_key_choice, raw_df, uploaded_file.name, st.session_state["name"])
-                    load_raw_item_counts.clear()
-                    load_ingestion_log.clear()
-                    load_stale_sources.clear()
-                    load_stale_sources_since_compute.clear()
-                    st.success(f"Staged {len(cleaned_df)} rows for '{source_key_choice}'.")
-                    # A fresh upload replaces raw_items right away, same
-                    # as Apply Now — recompute a fresh merge draft so
-                    # it's ready on the Merge tab instead of needing a
-                    # separate trip there just to notice something
-                    # changed. Stashed rather than shown directly: this
-                    # run ends in st.rerun(), which would wipe anything
-                    # rendered here before the frontend ever caught up.
-                    with st.spinner(f"Recomputing the merge draft with {source_key_choice}'s new data..."):
-                        st.session_state["_upload_auto_merge_result"] = auto_recompute_and_push_merge()
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Could not parse file: {e}")
-
-        st.divider()
-        st.subheader(f"Ingestion history for '{source_row['source_label']}'")
-        log_df = load_ingestion_log(source_key_choice)
-        if log_df.empty:
-            st.caption("No uploads recorded yet for this source.")
-        else:
-            latest = log_df.iloc[0]
-            st.caption(
-                f"Last upload: {latest['uploaded_at']} by {latest['uploaded_by'] or 'unknown'} — "
-                f"{latest['rows_staged']} staged, {latest['dropped_invalid_upc']} invalid UPC, "
-                f"{latest['dropped_duplicate_upc']} duplicate UPC dropped."
+    # ---- every upload so far -------------------------------------------------
+    st.divider()
+    st.markdown("**Upload history**")
+    if log_all.empty:
+        st.caption("No uploads recorded yet.")
+        return
+    h1, h2 = st.columns([1, 2])
+    pick = h1.selectbox("Show", ["All sources"] + sources_df["source_key"].tolist(), key="upload_hist_src",
+                        format_func=lambda k: k if k == "All sources" else f"{labels.get(k) or k} ({k})",
+                        label_visibility="collapsed")
+    hist = log_all if pick == "All sources" else log_all[log_all["source_key"] == pick]
+    h2.caption(f"{len(hist):,} upload(s), newest first.")
+    st.dataframe(
+        pd.DataFrame({
+            "When": hist["uploaded_at"].map(fmt_when), "Source": hist["source_key"].map(lambda k: labels.get(k) or k),
+            "File": hist["original_filename"].fillna(""), "By": hist["uploaded_by"].fillna(""),
+            "Rows read": hist["rows_parsed"], "Kept": hist["rows_staged"],
+            "Invalid UPC": hist["dropped_invalid_upc"], "Duplicate UPC": hist["dropped_duplicate_upc"],
+        }),
+        hide_index=True, width='stretch', height=min(360, 38 + 35 * len(hist)),
+        column_config={c: st.column_config.NumberColumn(format="localized")
+                       for c in ("Rows read", "Kept", "Invalid UPC", "Duplicate UPC")},
+    )
+    with_drops = hist[(hist["dropped_invalid_upc"].fillna(0) + hist["dropped_duplicate_upc"].fillna(0)) > 0]
+    if not with_drops.empty:
+        with st.expander(f"Rows dropped by an upload ({len(with_drops):,} upload(s) dropped some)"):
+            log_choice_id = st.selectbox(
+                "Upload", with_drops["id"].tolist(), key="upload_hist_drops",
+                format_func=lambda i: (lambda r: f"{fmt_when(r['uploaded_at'])} — {labels.get(r['source_key']) or r['source_key']}"
+                                                 f" — {r['original_filename'] or '(unknown file)'}")(with_drops.set_index("id").loc[i]),
             )
-            with st.expander(f"View full history ({len(log_df)} upload(s)) and dropped rows"):
-                st.dataframe(log_df, width='stretch', hide_index=True)
-
-                log_choice_id = st.selectbox(
-                    "View rejected rows for upload:",
-                    log_df["id"].tolist(),
-                    format_func=lambda i: (
-                        f"{log_df.loc[log_df['id'] == i, 'uploaded_at'].iloc[0]} — "
-                        f"{log_df.loc[log_df['id'] == i, 'original_filename'].iloc[0] or '(unknown file)'}"
-                    ),
-                )
-                rejected_for_log = load_rejected_rows(log_choice_id)
-                if rejected_for_log.empty:
-                    st.caption("Nothing was dropped on this upload.")
-                else:
-                    for reason in rejected_for_log["reason"].unique():
-                        st.markdown(f"**{reason}** — {REASON_EXPLANATIONS.get(reason, 'No explanation available.')}")
-                        st.dataframe(
-                            rejected_for_log[rejected_for_log["reason"] == reason],
-                            width='stretch',
-                            hide_index=True,
-                        )
+            rejected_for_log = load_rejected_rows(log_choice_id)
+            if rejected_for_log.empty:
+                st.caption("Nothing was dropped on this upload.")
+            for reason in rejected_for_log["reason"].unique():
+                st.markdown(f"**{reason}** — {REASON_EXPLANATIONS.get(reason, 'No explanation available.')}")
+                st.dataframe(rejected_for_log[rejected_for_log["reason"] == reason].drop(columns=["reason"]),
+                             width='stretch', hide_index=True)
 
 
 # -------------------------------------------------------------------
 # Merge
 # -------------------------------------------------------------------
+MERGE_HOW_IT_WORKS = (
+    "A Merge only ADDS items. Every source file is read, but for an item already in the item "
+    "master the files are only used to confirm it isn't new — its description, brand, category, "
+    "pack/size and Department Review group are never changed by a file, and it's kept even if no "
+    "file lists it any more. A UPC no one has yet is built from the highest-priority source "
+    "that has it (the first with every field filled in), cleaned by that source's rules, with "
+    "manual overrides on top; manually deleted UPCs are never brought back. After a push the "
+    "Department engine runs so every decision applies to the new items too: new items in a "
+    "decided group get its Department, new groups wait in Crosswalk/Unmatched (or are "
+    "auto-decided when the evidence is strong). Compute shows what would be added before anything "
+    "changes."
+)
+
+
+def after_merge_push(result: dict) -> list:
+    """After a Merge push (the Merge tab's, or an upload's Save): refresh what
+    it changed, and say what happened — [(kind, text)]."""
+    clear_items_cache()
+    for fn in (load_manual_items, load_stale_sources, load_dept_review_queue, load_broken_out_combos, load_decided_combos,
+               load_combo_member_items, load_pending_upc_overrides, load_dept_pending_changes, load_dept_pending_upc_changes,
+               load_discard_notices, load_last_merge_summary):
+        fn.clear()
+    clear_merge_compute_caches()
+    clear_snapshot_caches()
+    added = (result.get("engine_summary") or {}).get("items_added_to_groups")
+    msgs = [("success",
+             f"Added the new items — {result['item_count']:,} item(s) in the item master now "
+             f"(safety snapshot #{result['safety_snapshot_id']} taken first"
+             + (f"; this month's snapshot is now #{result['monthly_snapshot_id']}" if result.get("monthly_snapshot_id") is not None else "")
+             + ").")]
+    if result["engine_error"]:
+        msgs.append(("warning",
+                     f"The items are in, but putting them into their Department Review groups failed: {result['engine_error']} "
+                     "— run a Merge again to retry."))
+    elif result["engine_summary"]:
+        s_ = result["engine_summary"]
+        msgs.append(("info",
+                     f"Department Review: {added or 0:,} item(s) added to their groups"
+                     + (f", {s_['new_combos']:,} new group(s) ({s_['auto_decided']:,} auto-decided, "
+                        f"{s_['needs_review']:,} to review, {s_['unmatched']:,} unmatched)" if s_["new_combos"] else "")
+                     + (f"; in Broken Out groups {s_['items_auto_decided']:,} auto-decided by item match"
+                        + (f", {s_['items_to_decide']:,} waiting for a person" if s_.get("items_to_decide") else "")
+                        if s_.get("items_auto_decided") or s_.get("items_to_decide") else "")
+                     + (f"; {s_['reopened']:,} decided Broken Out group(s) reopened for them" if s_.get("reopened") else "")
+                     + ". Existing groups, their evidence and their decisions are unchanged."))
+    if result["discarded_item_master_upcs"]:
+        n = len(result["discarded_item_master_upcs"])
+        msgs.append(("warning",
+                     f"{n} staged Add Item {'change' if n == 1 else 'changes'} (UPC(s): "
+                     f"{', '.join(result['discarded_item_master_upcs'])}) were taken back — a file brought "
+                     "that UPC in, so it's in the item master now. The person who staged it was told."))
+        load_item_master_pending.clear()
+    return msgs
+
+
+def staged_add_collisions() -> list:
+    """Staged Add Item changes for UPCs the current Merge draft brings in from a file — [(upc, staged_by)]."""
+    pending = load_item_master_pending()
+    adds = [u_ for u_, c in pending.items() if c["change_type"] == "add"]
+    if not adds:
+        return []
+    with db_connect_cached() as conn:
+        incoming = set(pd.read_sql(text(
+            "SELECT s.upc FROM dbo.items_staged s WHERE NOT EXISTS (SELECT 1 FROM dbo.items i WHERE i.upc = s.upc)"), conn)["upc"])
+    return [(u_, pending[u_].get("staged_by")) for u_ in adds if u_ in incoming]
+
+
+def render_merge_push_result() -> None:
+    """What the last Merge push did — kept on screen until dismissed (the push
+    ends in a rerun, which would otherwise wipe it before anyone reads it)."""
+    msgs = st.session_state.get("_merge_push_msgs")
+    if not msgs:
+        return
+    with st.container(border=True, key="merge_push_result"):
+        c1, c2 = st.columns([6, 1], vertical_alignment="center")
+        c1.markdown("**Last push**")
+        if c2.button("Dismiss", key="merge_push_result_dismiss", width='stretch'):
+            st.session_state.pop("_merge_push_msgs", None)
+            st.rerun()
+        for kind, text_ in msgs:
+            getattr(st, kind)(text_)
+
+
 def render_merge_tab() -> None:
-    """The Merge tab."""
-    st.subheader("Merge staged sources into the item master")
-    with st.expander("How this works"):
+    """The Merge tab: where things stand and the one next step (Compute, then
+    review and Push), with the tools and history underneath."""
+    st.subheader("Merge")
+    st.caption("Adds new items from the source files to the item master. Existing items are never changed.",
+               help=MERGE_HOW_IT_WORKS)
+    render_merge_push_result()
+
+    stale = load_stale_sources()
+    last_merge = load_last_merge_summary()
+    sources_df = load_sources()
+    enabled_sources = sources_df[sources_df["enabled"] == True].sort_values("priority_rank")  # noqa: E712
+
+    # ---- 1. where things stand, and Compute ----------------------------------
+    compute_meta = load_merge_compute_meta()
+    draft_is_current = bool(compute_meta) and not load_stale_sources_since_compute()
+    with st.container(border=True, key="merge_status"):
+        c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+        if stale and draft_is_current:
+            c1.markdown(f"**New data waiting** — {', '.join(stale)} changed since the last Merge; the draft below "
+                        "already includes it.")
+        elif stale:
+            c1.markdown(f"**New data waiting** — {', '.join(stale)} changed since the last Merge. Compute a draft "
+                        "to see what it adds.")
+        else:
+            c1.markdown("**Up to date** — every source's current data is already in the item master.")
+        if last_merge:
+            c1.caption(f"Last Merge {fmt_when(last_merge['merged_at'])} by {last_merge['merged_by'] or 'unknown'} · "
+                       f"{last_merge['upc_count']:,} items" + (f" · {last_merge['added_count']:,} added"
+                                                              if last_merge.get("added_count") is not None else ""))
+        # Colored/primary only when there's actually fresher raw data to pull
+        # in — otherwise the loud red reads as "something's waiting on you".
+        compute_clicked = c2.button("Compute Merge", type="primary" if stale and not draft_is_current else "secondary",
+                                    width='stretch')
+        if compute_clicked:
+            mark_own_progress()
+            compute_progress = st.progress(0, text="Reading raw data, manual overrides, and deletions...")
+            priority_order = enabled_sources["source_key"].tolist()
+            final_df, overrides_applied, deleted_count = dept_mapping.compute_merge_final_df(ENGINE, priority_order)
+            if final_df is None:
+                compute_progress.empty()
+                st.warning("No staged rows for any enabled source, and no manually-added items. "
+                           "Upload files on the Upload & Ingest tab first.")
+            else:
+                compute_progress.progress(0.85, text="Comparing against the live item master and saving...")
+                dept_mapping.save_merge_compute(
+                    ENGINE, final_df, st.session_state["name"], overrides_applied, deleted_count,
+                )
+                compute_progress.empty()
+                clear_merge_compute_caches()
+                st.session_state["_toast"] = (
+                    f"Computed {len(final_df):,} item(s) "
+                    f"({overrides_applied} manual override(s) applied, {deleted_count} manually-deleted UPC(s) excluded) "
+                    "— review the draft below, then Push to apply it.", "", "long")
+                st.rerun()
+
+    # ---- 2. the draft, and Push ----------------------------------------------
+    if st.session_state.pop("_reset_confirm_push_merge", False):
+        st.session_state["confirm_push_merge"] = False
+    if compute_meta:
+        with st.container(border=True, key="merge_draft"):
+            d1, d2 = st.columns([4, 1.3], vertical_alignment="center")
+            d1.markdown(f"**Draft ready to push** — {compute_meta.get('added_count') or 0:,} new item(s) to add")
+            d1.caption(f"Computed {fmt_when(compute_meta['computed_at'])} by {compute_meta['computed_by'] or 'unknown'} · "
+                       f"{compute_meta['item_count']:,} items after pushing · {compute_meta['overrides_applied']} manual "
+                       f"override(s) applied · {compute_meta['deleted_excluded']} deleted UPC(s) left out")
+            if d2.button("Discard draft", key="merge_discard_draft", width='stretch'):
+                dept_mapping.discard_merge_compute(ENGINE)
+                clear_merge_compute_caches()
+                st.session_state["_toast"] = ("Discarded the draft. Nothing was changed.", "")
+                st.rerun()
+            mcol1, mcol2, mcol3 = st.columns(3)
+            mcol1.metric("New items to add", f"{compute_meta.get('added_count') or 0:,}", help="UPCs no one has yet — cleaned by every rule and decision, then added.")
+            mcol2.metric("Existing, differ in files", f"{compute_meta.get('changed_count') or 0:,}", help="Existing items whose source data now reads differently. Ignored — a Merge never changes an existing item.")
+            mcol3.metric("No longer in any file", f"{compute_meta.get('removed_count') or 0:,}", help="Existing items no file lists any more. Kept as they are.")
+            if compute_meta.get("changed_by_field") or compute_meta.get("changed_by_source"):
+                with st.expander("What differs in the files (ignored — existing items aren't changed)"):
+                    render_merge_change_breakdown(compute_meta.get("changed_by_field") or {}, compute_meta.get("changed_by_source") or {})
+            if compute_meta.get("added_count"):
+                with st.expander(f"The {compute_meta['added_count']:,} new item(s) — row data and the decision each will get"):
+                    with st.spinner("Working out each item's decision..."):
+                        preview = dept_mapping.draft_new_items(ENGINE)
+                    preview = with_lookalikes(preview, load_items())
+                    if "Looks like" in preview.columns:
+                        st.warning(f"{int((preview['Looks like'] != '').sum()):,} new item(s) look like an item already "
+                                   "in the item master, with a digit missing or added at the front of the UPC (see "
+                                   "“Looks like”). Both come in as separate items; if "
+                                   "they're the same, combine them after the push — Upload Reports → Possible duplicate UPCs.")
+                    render_item_decisions(preview, "draft_new", "merge_draft_new_items")
+
+            stale_since_compute = load_stale_sources_since_compute()
+            if stale_since_compute:
+                label = "source" if len(stale_since_compute) == 1 else "sources"
+                st.error(
+                    f"{len(stale_since_compute)} {label} ({', '.join(stale_since_compute)}) have raw "
+                    "data newer than this draft — it's out of date. Pushing will be blocked and this "
+                    "draft discarded; Compute Merge again first."
+                )
+
+            # Approval gate — a Merge push needs MERGE_PUSH_REQUIRED_APPROVALS
+            # distinct people to sign off before it goes live. Admins bypass the
+            # count (their own click is enough) but are still warned first if
+            # pushing right now could affect someone else's in-progress work.
+            approvals = compute_meta.get("approvals") or []
+            distinct_approvers = sorted({a["approver"] for a in approvals})
+            required = dept_mapping.MERGE_PUSH_REQUIRED_APPROVALS
+            a1, a2 = st.columns([4, 1.3], vertical_alignment="center")
+            if distinct_approvers:
+                a1.caption(f"Approved by {', '.join(distinct_approvers)} ({len(distinct_approvers)} of {required} needed"
+                           + (", admins exempt)" if is_admin else ")"))
+            else:
+                a1.caption(f"No approvals yet — {required} needed before this can be pushed (admins exempt).")
+            if st.session_state["name"] not in distinct_approvers:
+                if a2.button("Approve", key="approve_merge_compute", width='stretch'):
+                    dept_mapping.approve_merge_compute(ENGINE, st.session_state["name"])
+                    clear_merge_compute_caches()
+                    st.session_state["_toast"] = ("You approved this draft.", "")
+                    st.rerun()
+            else:
+                a2.caption("You approved it.")
+
+            collide = staged_add_collisions()
+            override_ack = True
+            if collide:
+                st.warning("A file brings in UPC(s) someone has staged to add by hand: "
+                           + ", ".join(f"{u_} ({who or 'someone'})" for u_, who in collide)
+                           + ". Pushing takes those staged adds back (the file's item comes in instead).")
+                override_ack = st.checkbox("Take their staged adds back and push", key="confirm_override_pending_work")
+            st.caption("Pushing adds the new items and puts each into its Department Review group — a decided group's "
+                       "Department applies to it straight away. Existing items, groups and decisions aren't changed. A "
+                       "safety snapshot is taken first, so this can be undone from Snapshots.")
+            enough_approvals = is_admin or len(distinct_approvers) >= required
+            has_new = bool(compute_meta.get("added_count"))
+            if not has_new:
+                st.caption("Nothing new to add — Discard draft clears it.")
+            if _push_confirm("I've reviewed this draft and I'm ready to update the database.", "confirm_push_merge",
+                             "Push Items to Database", "push_merge_draft", enough_approvals and override_ack and has_new):
+                mark_own_progress()
+                push_progress = st.progress(0, text="Starting push...")
+                result = dept_mapping.push_merge_compute(
+                    ENGINE, st.session_state["name"], is_admin=is_admin,
+                    on_progress=lambda label, frac: push_progress.progress(frac, text=label),
+                )
+                push_progress.empty()
+                if not (result.get("aborted_stale") or result.get("aborted_insufficient_approvals")):
+                    activity("Uploads & Merge", "Pushed a Merge", None, result.get("added_count") or result.get("item_count"),
+                             details={k: v for k, v in result.items() if isinstance(v, (int, float, str, bool, type(None)))})
+                clear_merge_compute_caches()
+                load_last_merge_summary.clear()
+                st.session_state["_reset_confirm_push_merge"] = True
+                if result.get("aborted_insufficient_approvals"):
+                    # Shouldn't be reachable — the button above is disabled
+                    # until this is satisfied — but defensive in case another
+                    # approval was pulled back mid-review.
+                    st.session_state["_toast"] = (
+                        f"Push blocked — only {len(distinct_approvers)} of {result['required']} required "
+                        "approval(s) are on this draft. Nothing was changed.", "", "infinite")
+                    st.rerun()
+                if result["aborted_stale"]:
+                    label = "source" if len(result["stale_sources"]) == 1 else "sources"
+                    st.session_state["_toast"] = (
+                        f"Push blocked and this draft discarded — {len(result['stale_sources'])} "
+                        f"{label} ({', '.join(result['stale_sources'])}) had raw data refreshed after "
+                        "this merge was computed. Nothing was changed in the database. Click Compute "
+                        "Merge again to build a fresh draft against the current data.", "", "infinite")
+                    st.rerun()
+                msgs = after_merge_push(result)
+                st.session_state["_merge_push_msgs"] = msgs
+                st.session_state["_toast"] = (f"Pushed {result['item_count']:,} item(s) to the database.", "")
+                st.rerun()
+
+    # ---- 3. tools and history ------------------------------------------------
+    st.markdown("")
+    t_rules, t_last, t_added, t_order, t_spot = st.tabs(
+        ["Check against the rules", "Last Merge", "Added by past Merges", "Source order", "Spot-check a UPC list"])
+    with t_rules:
         st.caption(
-            "A Merge only ADDS items. Every source file is read, but for an item already in the item "
-            "master the files are only used to confirm it isn't new — its description, brand, category, "
-            "pack/size and Department Review group are never changed by a file, and it's kept even if no "
-            "file lists it any more. A UPC no one has yet is built from the highest-priority source "
-            "that has it (the first with every field filled in), cleaned by that source's rules, with "
-            "manual overrides on top; manually deleted UPCs are never brought back. After a push the "
-            "Department engine runs so every decision applies to the new items too: new items in a "
-            "decided group get its Department, new groups wait in Crosswalk/Unmatched (or are "
-            "auto-decided when the evidence is strong). Compute shows what would be added before anything "
-            "changes."
-        )
-    with st.container(border=True):
-        st.markdown("**Check the item master against every rule and decision**")
-        st.caption(
-            'Re-checks every item against every rule and decision (about 10 s) and stages any fix.',
+            'Re-checks every item against every rule and decision (about 10 s). Fixes you apply go live at once, with an Undo.',
             help=("Decisions, Settings, adds, deletes and UPC Overrides already update the item master the moment "
-            "they're pushed — only the rows they affect — so this should find nothing. It re-checks every item "
-            "(about 10 seconds) and stages a fix: every item that would change, what would change, and the rule "
-            "or decision behind it. Nothing is written until you apply it, and an applied fix can be undone. "
-            "Nothing is ever taken from source files."),
+                  "they're pushed — only the rows they affect — so this should find nothing. It re-checks every item "
+                  "(about 10 seconds) and stages a fix: every item that would change, what would change, and the rule "
+                  "or decision behind it. Nothing is written until you apply it, and an applied fix can be undone. "
+                  "Nothing is ever taken from source files."),
         )
         undo = st.session_state.get("_rules_undo")
         if undo:
             u1, u2 = st.columns([3, 1])
             u1.caption(f"Last fix: {len(undo['upcs']):,} item(s) changed by {undo['by']}.")
             if u2.button("Undo that fix", key="rules_undo_btn", width='stretch'):
-                dept_mapping.undo_rules_plan(ENGINE, undo)
+                with st.spinner("Restoring the items..."):
+                    dept_mapping.undo_rules_plan(ENGINE, undo)
                 st.session_state.pop("_rules_undo", None)
-                load_items.clear()
+                clear_items_cache()
                 st.session_state["_toast"] = (f"Put {len(undo['upcs']):,} item(s) back exactly as they were.", "")
                 st.rerun()
         if st.button("Check now", key="rules_check_btn"):
@@ -7352,27 +9390,46 @@ def render_merge_tab() -> None:
             else:
                 st.warning(f"{plan['UPC'].nunique():,} item(s) would change ({len(plan):,} field change(s)). "
                            "Review them below before applying.")
-                st.dataframe(plan, hide_index=True, width='stretch', height=min(520, 38 + 35 * len(plan)))
+                shown = plan.assign(Field=plan["Field"].map(lambda f: ITEM_MASTER_FIELD_LABELS.get(f, f)),
+                                    **{"Will be": plan["Will be"].fillna("(blank)")})
+                st.dataframe(shown, hide_index=True, width='stretch', height=min(520, 38 + 35 * len(plan)))
                 st.download_button("Download the list (CSV)", plan.to_csv(index=False).encode(),
                                    file_name="item_master_recheck.csv", mime="text/csv", key="rules_dl")
-                a1, a2 = st.columns(2)
-                if a1.button(f"Apply these {len(plan):,} change(s)", type="primary", key="rules_fix_btn", width='stretch'):
+                b1, b2 = st.columns(2)
+                if b1.button(f"Apply these {len(plan):,} change(s)", type="primary", key="rules_fix_btn", width='stretch'):
                     with st.spinner("Applying..."):
                         res = dept_mapping.apply_rules_plan(ENGINE, plan, st.session_state["name"])
                     st.session_state.pop("_rules_plan", None)
                     if res["ok"]:
                         st.session_state["_rules_undo"] = res["undo"]
-                        load_items.clear()
+                        clear_items_cache()
                         st.session_state["_toast"] = (f"Applied {len(plan):,} change(s) — Undo that fix puts them back.", "")
                     else:
                         st.session_state["_toast"] = ("Something changed since the check — nothing was applied. Check again.", "")
                     st.rerun()
-                if a2.button("Discard", key="rules_discard_btn", width='stretch'):
+                if b2.button("Discard", key="rules_discard_btn", width='stretch'):
                     st.session_state.pop("_rules_plan", None)
                     st.rerun()
-
-    # ---- items added by past Merges -------------------------------------
-    with st.expander("Items added by past Merges — row data, and the decision each one got (or where it's waiting)"):
+    with t_last:
+        if not last_merge:
+            st.caption("No Merge has been pushed yet.")
+        elif last_merge.get("added_count") is None:
+            st.caption(f"{fmt_when(last_merge['merged_at'])} by {last_merge['merged_by'] or 'unknown'} — "
+                       "no impact summary recorded (it ran before this was kept).")
+        else:
+            st.caption(f"{fmt_when(last_merge['merged_at'])} by {last_merge['merged_by'] or 'unknown'} · "
+                       f"{last_merge['upc_count']:,} items")
+            lcol1, lcol2, lcol3 = st.columns(3)
+            lcol1.metric("Added", f"{last_merge['added_count']:,}")
+            lcol2.metric("Differed in files (ignored)", f"{last_merge['changed_count']:,}")
+            lcol3.metric("Not in files (kept)", f"{last_merge['removed_count']:,}")
+            st.caption(
+                f"{last_merge['overrides_applied'] or 0} manual override(s) applied, "
+                f"{last_merge['deleted_excluded'] or 0} manually-deleted UPC(s) excluded"
+            )
+            render_merge_change_breakdown(last_merge["changed_by_field"], last_merge["changed_by_source"])
+    with t_added:
+        st.caption("Row data for the items each Merge added, and the decision each one got (or where it's waiting).")
         merges = dept_mapping.list_merges_with_additions(ENGINE)
         recorded = merges[merges["recorded"] > 0]
         if recorded.empty:
@@ -7380,262 +9437,31 @@ def render_merge_tab() -> None:
         else:
             mid = st.selectbox(
                 "Merge", recorded["id"].tolist(), key="added_merge_pick",
-                format_func=lambda i: (lambda r: f"{pd.to_datetime(r['merged_at']):%Y-%m-%d %H:%M} UTC by {r['merged_by']} — "
+                format_func=lambda i: (lambda r: f"{fmt_when(r['merged_at'])} by {r['merged_by']} — "
                                                  f"{int(r['recorded']):,} item(s) added")(recorded.set_index('id').loc[i]),
             )
             added = dept_mapping.merge_added_items(ENGINE, int(mid))
             render_item_decisions(added, f"added_{mid}", f"merge_{mid}_added_items")
-
-    stale = load_stale_sources()
-    if stale:
-        label = "source" if len(stale) == 1 else "sources"
-        st.warning(
-            f"{len(stale)} {label} ({', '.join(stale)}) have raw data newer than the "
-            "last Merge — Item Master and Department Review still show the old data until you "
-            "compute and Push a new merge below."
-        )
-    else:
-        st.caption("Item Master is up to date with every source's current raw data.")
-
-    last_merge = load_last_merge_summary()
-    if last_merge:
-        with st.expander(
-            f"Last Merge — {last_merge['upc_count']:,} item(s), "
-            f"{last_merge['merged_at']:%Y-%m-%d %H:%M} by {last_merge['merged_by'] or 'unknown'}",
-        ):
-            if last_merge.get("added_count") is None:
-                st.caption("No impact summary recorded for this merge (it ran before this feature existed).")
-            else:
-                lcol1, lcol2, lcol3 = st.columns(3)
-                lcol1.metric("Added", f"{last_merge['added_count']:,}")
-                lcol2.metric("Differed in files (ignored)", f"{last_merge['changed_count']:,}")
-                lcol3.metric("Not in files (kept)", f"{last_merge['removed_count']:,}")
-                st.caption(
-                    f"{last_merge['overrides_applied'] or 0} manual override(s) applied, "
-                    f"{last_merge['deleted_excluded'] or 0} manually-deleted UPC(s) excluded"
-                )
-                render_merge_change_breakdown(last_merge["changed_by_field"], last_merge["changed_by_source"])
-
-    sources_df = load_sources()
-    enabled_sources = sources_df[sources_df["enabled"] == True].sort_values("priority_rank")
-    with st.expander("Source priority order (highest priority first)"):
-        st.dataframe(enabled_sources[["priority_rank", "source_key", "source_label"]], width='stretch', hide_index=True)
-
-    # Colored/primary only when there's actually fresher raw data to pull
-    # in — otherwise the loud red reads as "something's waiting on you"
-    # even when a click would just recompute the exact same result.
-    if st.button("Compute Merge", type="primary" if stale else "secondary"):
-        mark_own_progress()
-        compute_progress = st.progress(0, text="Reading raw data, manual overrides, and deletions...")
-        priority_order = enabled_sources["source_key"].tolist()
-        final_df, overrides_applied, deleted_count = dept_mapping.compute_merge_final_df(ENGINE, priority_order)
-        if final_df is None:
-            compute_progress.empty()
-            st.warning("No staged rows for any enabled source, and no manually-added items. "
-                       "Upload files on the Upload & Ingest tab first.")
-        else:
-            compute_progress.progress(0.85, text="Comparing against the live item master and saving...")
-            dept_mapping.save_merge_compute(
-                ENGINE, final_df, st.session_state["name"], overrides_applied, deleted_count,
-            )
-            compute_progress.empty()
-            clear_merge_compute_caches()
-            st.success(
-                f"Computed {len(final_df)} item(s) "
-                f"({overrides_applied} manual override(s) applied, {deleted_count} manually-deleted UPC(s) excluded) "
-                "— review below, then Push to apply it."
-            )
-            st.rerun()
-
-    st.divider()
-    if st.session_state.pop("_reset_confirm_push_merge", False):
-        st.session_state["confirm_push_merge"] = False
-    compute_meta = load_merge_compute_meta()
-    if not compute_meta:
-        st.caption("Nothing computed yet — click Compute Merge above.")
-    else:
-        st.success(
-            f"\U0001f7e2 **Computed merge ready to push** — {compute_meta.get('added_count') or 0:,} new item(s) "
-            "would be added. Existing items are never changed by a Merge. Review below, then push when ready."
-        )
-        with st.container(border=True):
-            st.markdown(f"**{compute_meta['item_count']:,} item(s) total** after pushing")
-            mcol1, mcol2, mcol3 = st.columns(3)
-            mcol1.metric("New items to add", f"{compute_meta.get('added_count') or 0:,}", help="UPCs no one has yet — cleaned by every rule and decision, then added.")
-            mcol2.metric("Existing, differ in files", f"{compute_meta.get('changed_count') or 0:,}", help="Existing items whose source data now reads differently. Ignored — a Merge never changes an existing item.")
-            mcol3.metric("No longer in any file", f"{compute_meta.get('removed_count') or 0:,}", help="Existing items no file lists any more. Kept as they are.")
-            st.caption(
-                f"{compute_meta['overrides_applied']} manual override(s) applied, "
-                f"{compute_meta['deleted_excluded']} manually-deleted UPC(s) excluded"
-            )
-            render_merge_change_breakdown(compute_meta.get("changed_by_field") or {}, compute_meta.get("changed_by_source") or {})
-            if compute_meta.get("added_count"):
-                with st.expander(f"The {compute_meta['added_count']:,} new item(s) — row data and the decision each will get"):
-                    with st.spinner("Working out each item's decision..."):
-                        preview = dept_mapping.draft_new_items(ENGINE)
-                    render_item_decisions(preview, "draft_new", "merge_draft_new_items")
-            st.caption(f"Computed {compute_meta['computed_at']} by {compute_meta['computed_by'] or 'unknown'}")
-            if st.button("Discard this computed merge"):
-                dept_mapping.discard_merge_compute(ENGINE)
-                clear_merge_compute_caches()
-                st.rerun()
-        stale_since_compute = load_stale_sources_since_compute()
-        if stale_since_compute:
-            label = "source" if len(stale_since_compute) == 1 else "sources"
-            st.error(
-                f"{len(stale_since_compute)} {label} ({', '.join(stale_since_compute)}) have raw "
-                "data newer than this computed merge — it's now out of date. Pushing will be "
-                "blocked and this draft discarded; Compute Merge again first."
-            )
-        st.warning(
-            "Pushing adds the new items, then re-runs Department Review's group engine so every decision "
-            "applies to them too (new items in decided groups get their Department; new groups wait in "
-            "Crosswalk/Unmatched). A safety snapshot is taken first, so this can be undone from Snapshots."
-        )
-
-        # Approval gate — a Merge push replaces the ENTIRE live item
-        # master and now happens far more often (any Sources/Upload/
-        # Dept Review push recomputes a fresh draft), so it needs
-        # MERGE_PUSH_REQUIRED_APPROVALS distinct people to sign off
-        # before it actually goes live. Admins bypass the count (their
-        # own click is enough) but still get warned first if pushing
-        # right now would risk someone else's in-progress work — that
-        # warning only means anything shown BEFORE the push, which is
-        # exactly why auto-recompute never auto-pushes anymore.
-        approvals = compute_meta.get("approvals") or []
-        distinct_approvers = sorted({a["approver"] for a in approvals})
-        required = dept_mapping.MERGE_PUSH_REQUIRED_APPROVALS
-        if distinct_approvers:
-            st.caption(f"Approved by: {', '.join(distinct_approvers)} ({len(distinct_approvers)} of {required} needed)")
-        else:
-            st.caption(f"No approvals yet — {required} needed before this can be pushed (admins exempt).")
-        if st.session_state["name"] not in distinct_approvers:
-            if st.button("Approve this merge", key="approve_merge_compute"):
-                dept_mapping.approve_merge_compute(ENGINE, st.session_state["name"])
-                clear_merge_compute_caches()
-                st.rerun()
-        else:
-            st.caption("You've already approved this draft.")
-
-        has_pending_elsewhere = dept_mapping.has_pending_review_work(ENGINE)
-        override_ack = True
-        if is_admin and has_pending_elsewhere:
-            st.error(
-                "Someone has a staged Item Master change or Department Review decision "
-                "in progress right now — pushing this merge could discard it (they'll see a notice "
-                "either way, but it's better to know first)."
-            )
-            override_ack = st.checkbox(
-                "I understand this may affect other users' in-progress work, and I want to push anyway.",
-                key="confirm_override_pending_work",
-            )
-
-        confirm_push = st.checkbox(
-            "I've reviewed this computed merge and I'm ready to update the database.",
-            key="confirm_push_merge",
-        )
-        enough_approvals = is_admin or len(distinct_approvers) >= required
-        if st.button("Push Items to Database", type="primary", disabled=not (confirm_push and enough_approvals and override_ack)):
-            mark_own_progress()
-            push_progress = st.progress(0, text="Starting push...")
-            result = dept_mapping.push_merge_compute(
-                ENGINE, st.session_state["name"], is_admin=is_admin,
-                on_progress=lambda label, frac: push_progress.progress(frac, text=label),
-            )
-            push_progress.empty()
-            if not (result.get("aborted_stale") or result.get("aborted_insufficient_approvals")):
-                activity("Uploads & Merge", "Pushed a Merge", None, result.get("added_count") or result.get("item_count"),
-                         details={k: v for k, v in result.items() if isinstance(v, (int, float, str, bool, type(None)))})
-            clear_merge_compute_caches()
-            load_last_merge_summary.clear()
-            st.session_state["_reset_confirm_push_merge"] = True
-            if result.get("aborted_insufficient_approvals"):
-                # Shouldn't be reachable — the button above is disabled
-                # until this is satisfied — but defensive in case
-                # another approval was pulled back mid-review.
-                st.error(
-                    f"Push blocked — only {len(distinct_approvers)} of {result['required']} required "
-                    "approval(s) are on this draft. Nothing was changed."
-                )
-                st.rerun()
-                st.stop()
-            if result["aborted_stale"]:
-                label = "source" if len(result["stale_sources"]) == 1 else "sources"
-                st.error(
-                    f"Push blocked and this draft discarded — {len(result['stale_sources'])} "
-                    f"{label} ({', '.join(result['stale_sources'])}) had raw data refreshed after "
-                    "this merge was computed. Nothing was changed in the database. Click Compute "
-                    "Merge again to build a fresh draft against the current data."
-                )
-                st.rerun()
-                st.stop()
-            load_items.clear()
-            load_manual_items.clear()
-            load_stale_sources.clear()
-            load_dept_review_queue.clear()
-            load_broken_out_combos.clear()
-            load_decided_combos.clear()
-            load_combo_member_items.clear()
-            load_pending_upc_overrides.clear()
-            load_dept_pending_changes.clear()
-            load_dept_pending_upc_changes.clear()
-            load_discard_notices.clear()
-            clear_snapshot_caches()
-            st.success(
-                f"Pushed {result['item_count']:,} item(s) to the database "
-                f"(safety snapshot #{result['safety_snapshot_id']} taken first"
-                + (f"; this month's snapshot is now #{result['monthly_snapshot_id']}" if result.get("monthly_snapshot_id") is not None else "")
-                + ")."
-            )
-            if result["engine_error"]:
-                st.warning(
-                    f"Item master updated, but recomputing Department Review's groups failed: "
-                    f"{result['engine_error']} — Item Master reflects the new merge; Crosswalk/"
-                    "Unmatched/Broken Out may be out of date until this is retried."
-                )
-            elif result["engine_summary"]:
-                s = result["engine_summary"]
-                st.info(
-                    f"Department Review groups recomputed: {s['new_combos']} new, "
-                    f"{s['auto_decided']} auto-decided, {s['needs_review']} need review, "
-                    f"{s['unmatched']} unmatched, {s['demoted']} demoted back to review."
-                )
-            if result["discarded_pending_combo_ids"]:
-                n = len(result["discarded_pending_combo_ids"])
-                label = "decision" if n == 1 else "decisions"
-                st.warning(
-                    f"{n} pending Department Review {label} (combo ID(s): "
-                    f"{', '.join(str(c) for c in result['discarded_pending_combo_ids'])}) "
-                    "were discarded because that combo's evidence changed during this Merge — "
-                    "please re-review them fresh in Crosswalk/Unmatched/Broken Out."
-                )
-            if result["discarded_item_master_upcs"]:
-                n = len(result["discarded_item_master_upcs"])
-                label = "change" if n == 1 else "changes"
-                st.warning(
-                    f"{n} pending Item Master {label} (UPC(s): "
-                    f"{', '.join(result['discarded_item_master_upcs'])}) were discarded because "
-                    "this Merge changed that item's data — please re-review and re-stage them "
-                    "against the current item."
-                )
-                load_item_master_pending.clear()
-            st.rerun()
-
-    st.divider()
-    with st.expander("Spot-check against a reference UPC list"):
+    with t_order:
+        st.caption("A new item is built from the first source in this order that has it. Change the order on the Sources tab.")
+        st.dataframe(
+            enabled_sources[["priority_rank", "source_label", "source_key"]].rename(
+                columns={"priority_rank": "Priority", "source_label": "Source", "source_key": "Key"}),
+            width='stretch', hide_index=True)
+    with t_spot:
         st.caption(
             "Compare this merge's UPCs with a known-good list — a very low match means a UPC cleaning rule is off.",
             help=("Upload a file with a known-good UPC list (e.g. a prior month's export) to sanity-check "
-            "that this merge's UPC cleaning still lines up with it. A very low match percentage usually "
-            "means a source's UPC cleaning rule (check digit, leading zeros) is now wrong — a match near "
-            "0% almost always means a cleaning mistake, not that the data genuinely changed that much."),
+                  "that this merge's UPC cleaning still lines up with it. A very low match percentage usually "
+                  "means a source's UPC cleaning rule (check digit, leading zeros) is now wrong — a match near "
+                  "0% almost always means a cleaning mistake, not that the data genuinely changed that much."),
         )
         reference_file = st.file_uploader(
             "Reference file (must have a column literally named 'UPC')", type=["xlsx", "xls", "csv"], key="reference_upload"
         )
         if reference_file is not None:
             try:
-                with st.spinner(f"Reading '{reference_file.name}' and comparing against the item master — this can take a moment for a large file..."):
+                with st.spinner(f"Reading '{reference_file.name}' and comparing against the item master..."):
                     if reference_file.name.lower().endswith(".csv"):
                         ref_df = pd.read_csv(reference_file, dtype=str)
                     else:
@@ -7647,8 +9473,7 @@ def render_merge_tab() -> None:
                         ref_upcs = set(
                             ref_df["UPC"].dropna().astype(str).str.strip().apply(lambda u: u.lstrip("0") or "0")
                         )
-                        with db_connect() as conn:
-                            current_upcs = set(pd.read_sql(text("SELECT upc FROM dbo.items"), conn)["upc"])
+                        current_upcs = set(load_items()["UPC"])
                         overlap = ref_upcs & current_upcs
                         pct = 100 * len(overlap) / len(ref_upcs) if ref_upcs else 0
 
@@ -7656,12 +9481,12 @@ def render_merge_tab() -> None:
                     st.error(f"No 'UPC' column found. Columns present: {columns_found}")
                 elif pct < 50:
                     st.error(
-                        f"Only {len(overlap)} of {len(ref_upcs)} reference UPCs matched ({pct:.1f}%). "
+                        f"Only {len(overlap):,} of {len(ref_upcs):,} reference UPCs matched ({pct:.1f}%). "
                         "This low a match usually means a UPC cleaning rule is wrong somewhere — "
                         "check Strip Trailing Digits / UPC Suffix Column on the Sources tab."
                     )
                 else:
-                    st.success(f"{len(overlap)} of {len(ref_upcs)} reference UPCs matched ({pct:.1f}%).")
+                    st.success(f"{len(overlap):,} of {len(ref_upcs):,} reference UPCs matched ({pct:.1f}%).")
             except Exception as e:
                 st.error(f"Could not read reference file: {e}")
 
@@ -7687,6 +9512,17 @@ def render_snapshots_tab() -> None:
     def _after_restore(msg):
         clear_snapshot_caches()
         st.cache_data.clear()
+        # Load the restored data now, while the loading card is up, so the
+        # next pages open straight away instead of each rebuilding on its own.
+        with st.spinner("Loading the restored data..."):
+            dept_mapping.refresh_items_in_background(ENGINE)
+            warm_break_out_cache()
+            for warm in (load_items, load_manual_items, load_broken_out_combos, load_decided_combos, load_group_facts,
+                         lambda: load_dept_review_queue("review"), lambda: load_dept_review_queue("unmatched")):
+                try:
+                    warm()
+                except Exception as e:  # (a page that can't pre-load just loads when it's opened)
+                    note_error("Snapshots — loading after a restore", e)
         st.session_state["_toast"] = (msg, "")
         st.rerun()
 
@@ -7721,15 +9557,19 @@ def render_snapshots_tab() -> None:
                 st.session_state["_confirm_undo_restore"] = True
                 st.rerun()
 
+    if st.session_state.pop("_snapshot_name_clear", False):
+        st.session_state["snapshot_name"] = ""  # taken: ready for the next one
     with st.form("take_snapshot_form"):
         label = st.text_input(
             "Name it so others know why it exists", placeholder="e.g. Before September price changes — all Broken Out done",
+            key="snapshot_name", max_chars=200,
         )
         if st.form_submit_button("Take Snapshot Now", type="primary"):
             with st.spinner("Taking snapshot..."):
                 snapshot_id = dept_mapping.take_snapshot(ENGINE, st.session_state["name"], label or None)
             clear_snapshot_caches()
             st.session_state["_toast"] = (f"Snapshot #{snapshot_id} taken.", "")
+            st.session_state["_snapshot_name_clear"] = True
             st.rerun()
 
     st.divider()
@@ -7738,15 +9578,15 @@ def render_snapshots_tab() -> None:
         st.caption("No snapshots yet.")
     else:
         KIND_BADGE = {"manual": "Manual", "monthly": "Monthly", "safety_merge": "Before a Merge push",
-                      "safety_restore": "Before a restore"}
-        fc1, fc2 = st.columns([2, 3])
+                      "safety_restore": "Before a restore", "safety_import": "Before a workbook upload"}
+        fc1, fc2 = st.columns([2.5, 2.5], vertical_alignment="center")
         show = fc1.segmented_control(
             "Show", ["All", "Manual", "Monthly", "Automatic"], default="All", key="snap_filter",
             label_visibility="collapsed",
         ) or "All"
         q = fc2.text_input("Search snapshots", key="snap_search", label_visibility="collapsed",
                            placeholder="Search name, person, or #id").strip().lower()
-        want = {"Manual": {"manual"}, "Monthly": {"monthly"}, "Automatic": {"safety_merge", "safety_restore"}}.get(show)
+        want = {"Manual": {"manual"}, "Monthly": {"monthly"}, "Automatic": {"safety_merge", "safety_restore", "safety_import"}}.get(show)
         rows = snapshots_df
         if want:
             rows = rows[rows["kind"].isin(want)]
@@ -7872,11 +9712,13 @@ def render_snapshots_tab() -> None:
                 if st.session_state.get(delete_key):
                     st.warning(f"Delete snapshot #{snapshot_id} for good? This can't be undone.")
                     dc1, dc2 = st.columns(2)
-                    if dc1.button(f"Delete #{snapshot_id}", key=f"confirm_delete_btn_{snapshot_id}", width='stretch'):
+                    if dc1.button(f"Delete #{snapshot_id}", key=f"confirm_delete_btn_{snapshot_id}", width='stretch', type="primary"):
                         st.session_state.pop(delete_key, None)
-                        dept_mapping.delete_snapshot(ENGINE, snapshot_id)
+                        with st.spinner(f"Deleting snapshot #{snapshot_id}..."):
+                            dept_mapping.delete_snapshot(ENGINE, snapshot_id)
                         activity("Snapshots", f"Deleted snapshot #{snapshot_id}", title)
                         clear_snapshot_caches()
+                        st.session_state["_toast"] = (f"Deleted snapshot #{snapshot_id}.", "")
                         st.rerun()
                     if dc2.button("Cancel", key=f"cancel_delete_btn_{snapshot_id}", width='stretch'):
                         st.session_state.pop(delete_key, None)
@@ -8200,6 +10042,7 @@ REVIEWER_TABS = {
     "Department Review": render_department_review_tab,
     "Add Item": render_add_item_tab,
     "Delete Item": render_delete_item_tab,
+    "Upload Reports": render_upload_reports_tab,
     "UPC Overrides": render_upc_overrides_tab,
     "Sources": render_sources_tab,
     "Pending Changes": render_pending_changes_tab,
@@ -8211,15 +10054,25 @@ REVIEWER_TABS = {
 if active_tab == "Item Master":
     render_item_master_tab()
 elif is_reviewer and active_tab in REVIEWER_TABS:
-    REVIEWER_TABS[active_tab]()
+    if os.environ.get("APP_PROFILE"):  # APP_PROFILE=1: where a tab's time goes (off normally)
+        import cProfile as _cp
+        import pstats as _ps
+        _prof = _cp.Profile()
+        _prof.runcall(REVIEWER_TABS[active_tab])
+        _ps.Stats(_prof, stream=__import__("sys").stderr).sort_stats("cumulative").print_stats(r"ItemMasterApp", 28)
+    else:
+        REVIEWER_TABS[active_tab]()
 
 
 def sync_url() -> None:
     """Keep the address matching what's on screen (only non-default values)."""
     want = {"tab": st.session_state.get("active_tab")}
     if want["tab"] == "Department Review":
-        sub = st.session_state.get("dept_review_subtab")
-        want["sub"] = sub
+        # The section is switched in the browser, so the page script keeps
+        # ?sub= in the address; the server only knows the one it opened on.
+        sub = st.query_params.get("sub") or st.session_state.get("dept_review_subtab")
+        if sub:
+            want["sub"] = sub
         f = get_shared_dept_filter()
         if f.get("search"):
             want["q"] = f["search"]
@@ -8229,11 +10082,12 @@ def sync_url() -> None:
             want["desc"] = "0"
         if f.get("page_size") not in (None, DEFAULT_GROUP_PAGE_SIZE):
             want["size"] = str(f["page_size"])
-        page = st.session_state.get(DEPT_PAGE_KEYS[sub], 1) if sub in DEPT_PAGE_KEYS else 1
-        if page and page > 1:
-            want["page"] = str(page)
+        if st.query_params.get("page"):
+            want["page"] = st.query_params["page"]
         if sub == "Broken Out" and st.session_state.get("_url_group_now"):
-            want["group"] = str(st.session_state["_url_group_now"])
+            want["group"] = str(st.session_state["_url_group_now"])  # the group you're working on, so a reload reopens it
+        elif st.query_params.get("group"):
+            want["group"] = st.query_params["group"]
     elif want["tab"] == "Item Master":
         for param, key in IM_URL.items():
             v = st.session_state.get(key)
@@ -8247,5 +10101,19 @@ def sync_url() -> None:
         st.query_params.update(want)
 
 
+# The confirmation for the last action, shown once the page is drawn — shown at
+# the start, a slow page (a reload after a push) could outlast it before anyone saw it.
+_toast = st.session_state.pop("_toast", None)
+if _toast:
+    # (message, icon[, duration]) — errors pass "infinite" so they stay until closed.
+    st.toast(_toast[0], duration=_toast[2] if len(_toast) > 2 else "short")
+
 sync_url()
+_mark(f"tab: {active_tab}")
 save_workspace()
+_mark("save workspace")
+if os.environ.get("APP_TIMING"):
+    import sys as _sys
+    _sys.stderr.write("RUN TIMES  " + "  ".join(f"{n}={1000 * (t - _RUN_MARKS[i][1]):.0f}ms"
+                                              for i, (n, t) in enumerate(_RUN_MARKS[1:]))
+                      + f"  TOTAL={1000 * (_RUN_MARKS[-1][1] - _RUN_MARKS[0][1]):.0f}ms\n")

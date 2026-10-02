@@ -85,7 +85,7 @@ try:
     print("\n== 1. Permissions")
     tabs_of = lambda at: at.radio(key="active_tab").options
     check("Activity" in tabs_of(a) and "Sources" in tabs_of(a), f"admin tabs: {tabs_of(a)}")
-    check(tabs_of(j) == ["Item Master", "Department Review", "Add Item", "Delete Item", "UPC Overrides", "Pending Changes", "Activity"],
+    check(tabs_of(j) == ["Item Master", "Department Review", "Add Item", "Delete Item", "Upload Reports", "UPC Overrides", "Pending Changes", "Activity"],
           f"editor tabs: {tabs_of(j)}")
     v = session("viewer"); run(v, "viewer")
     check(tabs_of(v) == ["Item Master"], f"viewer tabs: {tabs_of(v)}")

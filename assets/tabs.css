@@ -64,11 +64,33 @@ div.st-key-dept_review_unmatched_page_caption {
    label's space), so a fixed top-padding guess would need a
    different value for each row. Bottom-anchoring self-adjusts to
    whatever the sibling's real height is instead. */
-div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"]:has(div.st-key-dept_sort_desc_wrap),
+div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"]:has(div[class*="st-key-dept_sort_desc_wrap"]),
 div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"]:has(div[class*="_lock_wrap"]) {
     justify-content: flex-end !important;
 }
-div.st-key-dept_sort_desc_wrap,
+div[class*="st-key-dept_sort_desc_wrap"],
 div[class*="_lock_wrap"] {
     margin-bottom: 9px;
+}
+
+/* "Descending" stays on one line beside the Sort dropdown. */
+div[class*="st-key-dept_sort_desc_wrap"] label p { white-space: nowrap; }
+
+/* Upload reports → Possible duplicates: the two items side by side */
+.dup-upc { font-size: 1.15rem; font-weight: 600; letter-spacing: .02em; }
+.dup-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .3rem .75rem; margin: .35rem 0 .6rem; font-size: .9rem; }
+.dup-lbl { opacity: .6; }
+.dup-val { overflow-wrap: break-word; word-break: normal; min-width: 0; }
+.dup-diff { background: rgba(255, 170, 0, .18); border-radius: 4px; padding: .05rem .35rem; margin-left: -.35rem;
+  box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.dup-none { opacity: .4; }
+.dup-why { font-size: .9rem; line-height: 1.45; }
+/* "What the files say": wide enough for each file's whole line */
+[data-testid="stPopoverBody"]:has(.dup-files) { width: min(48rem, 92vw) !important; max-width: none !important; }
+
+/* A shortcut's landing: the group it opened, glowing for a moment. */
+.app-jump-target {
+  box-shadow: 0 0 0 3px #f59e0b, 0 0 18px 2px rgba(245, 158, 11, 0.45) !important;
+  border-radius: 0.5rem;
+  transition: box-shadow 0.8s ease;
 }

@@ -27,7 +27,7 @@ tabs = {"Crosswalk": ("dept_review_review", "dept_review_page_num_review", "appr
 for sub, (tk, pnk, card) in tabs.items():
     goto(jason, "Department Review", sub)
     size = jason.selectbox(key=f"{tk}_page_size")
-    check(size.options == ["10", "25", "50", "100"] and size.value == 25, f"{sub}: page sizes 10/25/50/100, default 25 ({size.options}, {size.value})")
+    check(size.options == ["10 per page", "25 per page", "50 per page", "100 per page"] and size.value == 25, f"{sub}: page sizes 10/25/50/100, default 25 ({size.options}, {size.value})")
     n = len([b for b in cards(jason, card) if not b.key.startswith("revert_decided_queue_")])
     check(n == 25 or n < 25, f"{sub}: 25 groups on page 1 ({n})")
     size.select(10); run(jason, f"{sub}: 10 per page")
@@ -69,10 +69,11 @@ aj.sidebar.segmented_control(key="notif_view").set_value("Team"); run(aj, "Team 
 kinds = aj.sidebar.selectbox(key="notif_kind").options
 print("  type filter:", kinds)
 check(len(kinds) == 9, "type filter lists every kind")
-jason.button(key="topbar_bell").click(); run(jason, "bell hides sidebar")
-check(not any(m.value.startswith("### Notifications") for m in jason.sidebar.markdown), "sidebar hidden")
-jason.button(key="topbar_bell").click(); run(jason, "bell shows sidebar")
-check(any(m.value.startswith("### Notifications") for m in jason.sidebar.markdown), "sidebar back")
+# (the bell never hides the notifications — it only opens the sidebar, in the browser)
+jason.button(key="topbar_bell").click(); run(jason, "click the bell")
+check(any(m.value.startswith("### Notifications") for m in jason.sidebar.markdown), "notifications still showing")
+jason.button(key="topbar_bell").click(); run(jason, "click the bell again")
+check(any(m.value.startswith("### Notifications") for m in jason.sidebar.markdown), "and still showing")
 
 # workbench typing matcher (runs the app's own function)
 import ast

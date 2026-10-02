@@ -18,30 +18,37 @@ div[data-testid="stSpinner"]:has(code) { display: none !important; }
    loading card instead of sitting behind the veil. */
 [data-test-script-state="running"] div[data-testid="stSpinner"] {
     position: fixed !important;
-    top: calc(42% + 3.6rem);
+    top: calc(42% + 1.66rem);  /* where the card's own "Loading…" line is */
     left: 50%;
-    transform: translateX(-50%);
+    transform: translate(-50%, -50%);
     z-index: 1000300;
-    width: min(30rem, 86vw);
+    width: min(24rem, 78vw);
     text-align: center;
     justify-content: center;
-    color: rgba(255, 255, 255, 0.72);
-    font-size: 0.85rem;
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 0.9rem;
+    font-weight: 500;
     animation: app-fade-in 0.2s ease-out 0.3s both;
 }
-[data-test-script-state="running"] div[data-testid="stSpinner"] i,
-[data-test-script-state="running"] div[data-testid="stSpinner"] svg { display: none !important; }
-/* Content arriving while a page builds (group cards load in one after
-   another) fades in instead of popping into place. Only on first
-   appearance — anything already on screen isn't re-animated. Cards
-   (bordered boxes) also rise a few pixels; plain elements only fade,
-   since a moving parent would drag the fixed top bar along with it. */
-@keyframes app-fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes app-card-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-[data-testid="stMain"] div[data-testid="stElementContainer"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])),
-[data-testid="stMain"] div[data-app-card="1"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
-    animation: app-fade-in 0.25s ease-out backwards;
+[data-test-script-state="running"] div[data-testid="stSpinner"] p { margin: 0; }
+[data-test-script-state="running"] div[data-testid="stSpinner"] > div,
+[data-test-script-state="running"] div[data-testid="stSpinner"] > div > div,
+[data-test-script-state="running"] div[data-testid="stSpinner"] [role="status"] {
+    width: 100%;
+    justify-content: center;
+    text-align: center;
 }
+[data-test-script-state="running"] div[data-testid="stSpinner"] i,
+[data-test-script-state="running"] div[data-testid="stSpinner"] svg,
+[data-test-script-state="running"] div[data-testid="stSpinner"] [data-testid="stSpinnerIcon"],
+[data-test-script-state="running"] div[data-testid="stSpinner"] span:has(> [data-testid="stSpinnerIcon"]) { display: none !important; }
+/* (with the icon gone, no gap either — the message sits dead centre under the card's own spinner) */
+[data-test-script-state="running"] div[data-testid="stSpinner"] > div { gap: 0 !important; padding: 0 !important; margin: 0 !important; }
+/* The card holds that message: wide enough for it, and its generic
+   "Loading…" gives way to it (one message, inside the card). */
+body:has([data-test-script-state="running"] div[data-testid="stSpinner"]) .app-loading-overlay { width: min(26rem, 82vw); }
+body:has([data-test-script-state="running"] div[data-testid="stSpinner"]) .app-loading-text { visibility: hidden; }
+@keyframes app-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
     [data-testid="stMain"] * { animation: none !important; }
 }
@@ -123,7 +130,7 @@ body:has(.own-progress-marker) .app-loading-overlay {
    placeholder cards mark where more is still arriving. Everything waits
    ~0.35s, so quick clicks never flash. */
 @keyframes app-skel-in { from { opacity: 0; } to { opacity: 1; } }
-body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]):not(:has(.app-busy-lock, [data-testid="stSpinner"]))::after {
+body:not([data-tab-switch]):not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]:not([data-testid="stExpander"] *)):not(:has(.app-busy-lock, [data-testid="stSpinner"]))::after {
     content: "";
     position: absolute;
     inset: 0;
@@ -141,9 +148,9 @@ body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-
     background-position: -140% 0, 18px 18px, 18px 42px, 18px 64px, right 18px top 16px;
     background-repeat: no-repeat;
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
-    animation: app-skel-in 0.18s ease-out 0.35s backwards, app-shimmer 1.6s ease-in-out 0.35s infinite;
+    animation: app-skel-in 0.25s ease-out 0.9s backwards, app-shimmer 1.6s ease-in-out 0.9s infinite;
 }
-body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]):not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
+body:not([data-tab-switch]):not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="true"]:not([data-testid="stExpander"] *)):not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
     position: relative;
     overflow: hidden;
 }
@@ -153,12 +160,12 @@ body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-
     to   { background-position: 240% 0, 18px 18px, 18px 42px, 18px 64px, right 18px top 16px; }
 }
 /* loose pieces outside cards: dim while they wait */
-body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-testid="stElementContainer"][data-stale="true"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
-    opacity: 0.35 !important;
-    transition: opacity 0.2s ease 0.35s !important;
+body:not([data-tab-switch]):not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMain"] div[data-testid="stElementContainer"][data-stale="true"]:not(:has(.app-busy-lock, [data-testid="stSpinner"])) {
+    opacity: 0.6 !important;
+    transition: opacity 0.3s ease 0.5s !important;
 }
 /* where more is still arriving */
-body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-test-script-state="running"] [data-testid="stMainBlockContainer"]::after {
+body[data-tab-switch] [data-testid="stMainBlockContainer"]::after {
     content: "";
     display: block;
     height: 200px;
@@ -181,9 +188,132 @@ body:not(:has(.app-quiet-run, [data-testid="stDialog"], [role="dialog"])) [data-
     border-radius: 0.5rem;
     -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
     mask-image: linear-gradient(to bottom, #000 55%, transparent);
-    animation: app-skel-in 0.2s ease-out 0.35s backwards, app-shimmer-tail 1.6s ease-in-out 0.35s infinite;
+    animation: app-skel-in 0.25s ease-out 0.6s backwards, app-shimmer-tail 1.6s ease-in-out 0.6s infinite;
 }
 @keyframes app-shimmer-tail {
     from { background-position: -140% 0, 18px 18px, 18px 42px, right 18px top 16px, 0 0, 18px 118px, 18px 142px, right 18px top 116px, 0 100px; }
     to   { background-position: 240% 0, 18px 18px, 18px 42px, right 18px top 16px, 0 0, 18px 118px, 18px 142px, right 18px top 116px, 0 100px; }
+}
+
+/* Switching tabs (flagged by the page script the moment a tab is clicked):
+   the old tab's content disappears at once and placeholder cards show right
+   under the tab bar until the new tab's content arrives, which then takes
+   their place. The title and the tab bars stay put. */
+body[data-tab-phase="wait"][data-tab-switch="main"] [data-testid="stMain"] .st-key-active_tab ~ *,
+body[data-tab-phase="wait"][data-tab-switch="sub"] [data-testid="stMain"] .st-key-dept_review_subtab ~ *,
+body[data-tab-switch="main"] [data-testid="stMain"] .st-key-active_tab ~ div[data-stale="true"],
+body[data-tab-switch="main"] [data-testid="stMain"] .st-key-active_tab ~ * div[data-stale="true"],
+body[data-tab-switch="main"] [data-testid="stMain"] .st-key-active_tab ~ div[data-testid="stLayoutWrapper"]:has([data-stale="true"]):not(:has([data-stale="false"])),
+body[data-tab-switch="sub"] [data-testid="stMain"] .st-key-dept_review_subtab ~ div[data-stale="true"],
+body[data-tab-switch="sub"] [data-testid="stMain"] .st-key-dept_review_subtab ~ * div[data-stale="true"],
+body[data-tab-switch="sub"] [data-testid="stMain"] .st-key-dept_review_subtab ~ div[data-testid="stLayoutWrapper"]:has([data-stale="true"]):not(:has([data-stale="false"])) {
+    display: none !important;
+}
+body[data-tab-switch] [data-testid="stMain"] div[data-app-card="1"]::after { display: none !important; }
+body[data-tab-switch] [data-testid="stMainBlockContainer"]::after {
+    animation: app-shimmer-tail 1.6s ease-in-out infinite !important;
+}
+
+/* the hidden Catch up button the page script presses (see render_department_review_tab) */
+.st-key-dr_catch_up_btn { display: none !important; }
+
+/* Other sections catching up after an action (set by the page script): a
+   pulsing dot on their tab buttons, and one opened before it's finished is
+   dimmed with "Updating…" and can't be clicked until it is. */
+@keyframes app-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+[class*="st-key-dr_sections_"] [role="tab"][data-updating]::after {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-left: 6px;
+    border-radius: 50%;
+    background: #ffa421;
+    vertical-align: middle;
+    animation: app-pulse 1s ease-in-out infinite;
+}
+[role="tabpanel"][data-updating] {
+    position: relative;
+}
+[role="tabpanel"][data-updating] > * {
+    opacity: 0.45;
+    pointer-events: none;
+    transition: opacity 0.15s ease-out;
+}
+[role="tabpanel"][data-updating]::before {
+    content: "Updating…";
+    position: sticky;
+    top: 3.2rem;
+    z-index: 30;
+    display: block;
+    width: max-content;
+    margin: 0 auto 0.5rem;
+    padding: 0.25rem 0.8rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(22, 26, 34, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* A card part-way through being redrawn (some of it already new, the rest
+   still left over from before): hide the leftovers, so a card never shows
+   pieces of whatever card sat in that spot before (e.g. another group's
+   Undo button after an undo). They're removed when the run finishes. */
+[data-test-script-state="running"] [data-testid="stMain"] div[data-app-card="1"]:has([data-stale="false"]:not([data-testid="stExpander"] *)) [data-testid="stElementContainer"][data-stale="true"]:not([data-testid="stExpander"] *) {
+    visibility: hidden !important;
+}
+
+/* "Show affected items": while its list loads, a placeholder at the list's
+   own size shimmers (a transform animation, smooth even while the page is
+   busy); then the list fades in in the same space. */
+.app-aff-ph {
+    position: relative;
+    overflow: hidden;
+    border-radius: 0.5rem;
+    background: rgba(255, 255, 255, 0.06);
+}
+.app-aff-ph::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.12), transparent);
+    animation: app-aff-shimmer 1.1s ease-in-out infinite;
+}
+@keyframes app-aff-shimmer { to { transform: translateX(100%); } }
+[data-testid="stExpanderDetails"] [data-testid="stDataFrame"] {
+    animation: app-aff-in 0.18s ease-out;
+}
+@keyframes app-aff-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* Item Master's edit bar keeps one height whether it shows the hint or the
+   Stage Changes / Discard buttons, so the grid doesn't jump on the first edit. */
+.st-key-im_edit_bar { min-height: 2.5rem; }
+
+/* Operations with their own progress bar (Compute / Push Merge, monthly
+   refresh): the page is locked like any big operation, and the progress bar
+   itself sits in the centred card — clicking something else mid-push could
+   stop the run part-way through. */
+body:has([data-test-script-state="running"] .own-progress-marker) .app-busy-lock,
+body:has([data-test-script-state="running"] [data-testid="stMain"] [data-testid="stProgress"]) .app-busy-lock {
+    visibility: visible;
+    background: rgba(14, 17, 23, 0.6);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    transition: visibility 0s linear 0.2s, background 0.25s ease-in 0.2s;
+}
+[data-test-script-state="running"] [data-testid="stMain"] [data-testid="stElementContainer"]:has(> [data-testid="stProgress"]),
+[data-test-script-state="running"] [data-testid="stMain"] [data-testid="stElementContainer"]:has([data-testid="stProgress"]):not(:has([data-testid="stElementContainer"])) {
+    position: fixed !important;
+    top: 42%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 1000300;
+    width: min(28rem, 86vw) !important;
+    padding: 1.3rem 1.6rem 1.1rem;
+    border-radius: 14px;
+    background: rgba(22, 26, 34, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
 }

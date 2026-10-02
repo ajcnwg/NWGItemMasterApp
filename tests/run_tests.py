@@ -71,12 +71,15 @@ SUITES = [
     'ui_import_review',
     'ui_system',
     'ui_errors',
+    'ui_input_checks',
+    'ui_upload_reports',
 ]
 
 # What a snapshot doesn't hold, in parent → child order (an upload log row
 # before its rejected rows).
 KEEP_TABLES = ["activity_log", "dept_settings_requests", "app_errors", "user_workspace", "user_last_seen",
-               "raw_items", "source_raw_uploads", "ingestion_log", "ingestion_rejected_rows", "merge_added_items"]
+               "raw_items", "source_raw_uploads", "ingestion_log", "ingestion_rejected_rows", "merge_added_items",
+               "source_upc_seen", "upload_reports", "upload_report_sources", "upload_report_items", "dup_not_duplicate", "notification_dismissals"]
 BAK = "zz_testbak_"
 BEFORE_LABEL = "Before tests (restored when they finish)"
 
@@ -98,14 +101,20 @@ def leftover_backup(E) -> bool:
 
 def backup(E) -> None:
     from sqlalchemy import text
+    from itemmaster import upload_reports, ingest
     with E.begin() as c:
+        ingest.ensure_upc_seen(c)
+        upload_reports.ensure_tables(c)  # (so every table to keep exists)
+        from itemmaster.dept_mapping import NOTIF_DISMISS_DDL
+        c.execute(text(NOTIF_DISMISS_DDL))
         for t in KEEP_TABLES:
             c.execute(text(f"SELECT * INTO dbo.{BAK}{t} FROM dbo.{t}"))
 
 
-def put_back(E) -> None:
+def put_back(E, keep_copies: bool = False) -> None:
     """Everything back from the copies, in one transaction: children emptied
-    first, parents refilled first. Does nothing if there are no copies."""
+    first, parents refilled first. Does nothing if there are no copies.
+    keep_copies: between suites (so each starts from the same data)."""
     from sqlalchemy import text
     with E.begin() as c:
         have = [t for t in KEEP_TABLES if _has(c, BAK + t)]
@@ -122,7 +131,7 @@ def put_back(E) -> None:
             c.execute(text(f"INSERT INTO dbo.{t} ({col_list}) SELECT {col_list} FROM dbo.{BAK}{t}"))
             if ident:
                 c.execute(text(f"SET IDENTITY_INSERT dbo.{t} OFF"))
-        for t in have:
+        for t in ([] if keep_copies else have):
             c.execute(text(f"DROP TABLE dbo.{BAK}{t}"))
 
 
@@ -184,12 +193,15 @@ def main(argv) -> None:
                 r = subprocess.run([sys.executable, os.path.join(TESTS, name + ".py")], cwd=APP, env=env, capture_output=True,
                                    text=True, encoding="utf-8", errors="replace", timeout=3600)
                 log = r.stdout + r.stderr
+                died = r.returncode != 0
             except subprocess.TimeoutExpired as e:
                 log = (e.stdout or "") + "\nTIMEOUT"
+                died = True
             open(os.path.join(TESTS, "logs", f"{name}.txt"), "w", encoding="utf-8").write(log)
             p = len(re.findall(r"^\s*PASS\b", log, re.M))
             f = len(re.findall(r"^\s*FAIL\b", log, re.M))
-            crash = "  CRASHED" if re.search(r"^Traceback \(most recent", log, re.M) else ""
+            # (a suite's deliberate errors log tracebacks too — only a non-zero exit is a crash)
+            crash = "  CRASHED" if died else ""
             totals[0] += p
             totals[1] += f
             line = f"{name:24} {time.time() - t:6.0f}s  PASS {p:3}  FAIL {f:3}{crash}"
@@ -197,6 +209,7 @@ def main(argv) -> None:
             out.write(line + "\n")
             out.flush()
             dm.restore_snapshot(E, 0, "Tests")
+            put_back(E, keep_copies=True)  # (uploads, seen-history, reports: each suite starts from the same data)
         line = f"\nTOTAL  PASS {totals[0]}  FAIL {totals[1]}"
         print(line, flush=True)
         out.write(line + "\n")

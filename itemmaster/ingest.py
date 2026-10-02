@@ -69,11 +69,29 @@ def clean_upc(value) -> str | None:
     text = str(value).strip()
     if not text or text.lower() == "nan":
         return INVALID_UPC
+    if re.search(r"[A-Za-z]", text):
+        return INVALID_UPC  # letters mean it isn't a UPC (a typo, or Excel's "7.06E+11")
     digits = re.sub(r"\D", "", _strip_float_artifact(text))
     if not digits:
         return INVALID_UPC
     digits = digits[-12:].lstrip("0")
     return digits or INVALID_UPC
+
+
+def invalid_upc_reason(value) -> str:
+    """Why clean_upc rejected a value, in a few words."""
+    text = "" if value is None else str(value).strip()
+    if not text or text.lower() == "nan":
+        return "it's blank"
+    if re.search(r"[A-Za-z]", text):
+        return "UPCs are digits only"
+    if not re.sub(r"\D", "", text):
+        return "it has no digits"
+    return "it's all zeros"
+
+
+# A UPC Excel has turned into scientific notation ("7.06128E+11", "7,06E+11").
+SCI_UPC = r"\s*\d+([.,]\d+)?[eE][+-]?\d+\s*"
 
 
 def generic_clean_upc(value, strip_trailing_digits: int = 0) -> str | None:
@@ -82,6 +100,8 @@ def generic_clean_upc(value, strip_trailing_digits: int = 0) -> str | None:
     text = str(value).strip()
     if not text or text.lower() == "nan":
         return INVALID_UPC
+    if re.search(r"[A-Za-z]", text):
+        return INVALID_UPC  # same rule as clean_upc: letters mean it isn't a UPC
     digits = re.sub(r"\D", "", _strip_float_artifact(text))
     if strip_trailing_digits:
         digits = digits[:-strip_trailing_digits] if len(digits) > strip_trailing_digits else ""
@@ -213,9 +233,91 @@ def split_pack_size_uom(values: pd.Series, size_format: str, uom_aliases: str = 
     return pd.Series(packs, index=index), pd.Series(sizes, index=index), pd.Series(uoms, index=index)
 
 
+class FileProblem(ValueError):
+    """A file that can't be taken as it is. The message says, in plain words,
+    what's wrong with it and what to do — it's shown to people as-is.
+    `detail` is optional supporting information (e.g. the columns the file does
+    have), shown smaller underneath."""
+
+    def __init__(self, message: str, detail: str = None):
+        super().__init__(message)
+        self.detail = detail
+
+
+# Each column a source's settings can name, and what people call it.
+MAPPED_COLUMNS = {
+    "upc_column": "UPC", "upc_suffix_column": "UPC suffix (check digit)", "department_column": "Department",
+    "category_column": "Category", "subcategory_column": "Subcategory", "brand_column": "Brand",
+    "description_column": "Description", "pack_column": "Pack", "size_column": "Size", "uom_column": "UOM",
+    "exclude_column": "Exclude",
+}
+
+
+def missing_columns(raw_df: pd.DataFrame, source: dict) -> list:
+    """[(what, column name)] for every column the source's settings name that
+    the file doesn't have."""
+    have = set(raw_df.columns)
+    out = []
+    for key, what in MAPPED_COLUMNS.items():
+        col = source.get(key)
+        if isinstance(col, str) and col.strip() and col not in have:
+            out.append((what, col))
+    return out
+
+
+def _source_name(source: dict) -> str:
+    return source.get("source_label") or source.get("source_key") or "this source"
+
+
+def _read_problem(e: Exception, uploaded_file, source: dict) -> FileProblem:
+    """A plain-words FileProblem for whatever went wrong reading a file."""
+    name = getattr(uploaded_file, "name", "The file")
+    msg = str(e)
+    kind = type(e).__name__
+    if kind in ("BadZipFile", "InvalidFileException") or "zip file" in msg.lower():
+        return FileProblem(f"{name} isn't a readable Excel file — it may be damaged, still open/locked, or a "
+                           "different kind of file renamed to .xlsx. Open it in Excel, save it as .xlsx, and upload it again.")
+    if "Worksheet" in msg and "not found" in msg or ("sheet" in msg.lower() and "not found" in msg.lower()):
+        try:
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            sheets = pd.ExcelFile(uploaded_file).sheet_names
+            have = f" Its sheets are: {', '.join(sheets)}."
+        except Exception:
+            have = ""
+        return FileProblem(f"{name} has no sheet named “{source.get('sheet_name')}”, which {_source_name(source)}'s "
+                           f"settings read from.{have} Check it's the right file, or fix Sheet Name on the Sources tab.")
+    if kind == "EmptyDataError":
+        return FileProblem(f"{name} is empty — there's nothing in it to read.")
+    if kind == "UnicodeDecodeError":
+        return FileProblem(f"{name} uses a text encoding that couldn't be read. Save it from Excel as "
+                           "“CSV UTF-8” or as .xlsx, and upload it again.")
+    if kind == "ParserError":
+        return FileProblem(f"{name} isn't a well-formed CSV (the rows don't line up into columns). "
+                           "Open it in Excel, save it as .xlsx, and upload it again.")
+    return FileProblem(f"{name} couldn't be read ({msg[:200]}). Check it's the right file for {_source_name(source)}.")
+
+
 def read_raw_file(uploaded_file, source: dict) -> pd.DataFrame:
     """Reads the uploaded file into a DataFrame with original column headers,
-    using the source's configured sheet name and header row."""
+    using the source's configured sheet name and header row. Anything that
+    stops it being read raises FileProblem with a plain-words reason."""
+    name = getattr(uploaded_file, "name", "") or ""
+    if not name.lower().endswith((".csv", ".xlsx", ".xls", ".xlsb")):
+        raise FileProblem(f"{name or 'That file'} isn't a spreadsheet — upload an .xlsx, .xls, .xlsb or .csv file.")
+    try:
+        df = _read_raw_file(uploaded_file, source)
+    except FileProblem:
+        raise
+    except Exception as e:
+        raise _read_problem(e, uploaded_file, source) from e
+    if df.empty or df.dropna(how="all").empty:
+        raise FileProblem(f"{name} has no rows under its header row (row {int(source.get('header_row') or 1)}) — "
+                          "it may be empty, or the header row setting on the Sources tab may be wrong.")
+    return df
+
+
+def _read_raw_file(uploaded_file, source: dict) -> pd.DataFrame:
     filename = uploaded_file.name.lower()
     header_row_index = max(int(source["header_row"]) - 1, 0)
 
@@ -255,9 +357,18 @@ def map_and_clean(raw_df: pd.DataFrame, source: dict) -> pd.DataFrame:
     }
 
     upc_column = source["upc_column"]
-    if upc_column not in raw_df.columns:
-        raise ValueError(f"UPC column '{upc_column}' not found in uploaded file. "
-                          f"Available columns: {list(raw_df.columns)[:20]}...")
+    missing = missing_columns(raw_df, source)
+    if missing:
+        # Every column the settings name must be there — a file without them
+        # would silently come in with blank fields (or wrong UPCs).
+        cols = [str(c) for c in raw_df.columns]
+        header_hint = (f" Most of its column names are blank, so row {int(source.get('header_row') or 1)} may not be "
+                       "the header row." if sum(c.startswith("Unnamed") for c in cols) > len(cols) / 2 else "")
+        raise FileProblem(
+            f"This file is missing {len(missing)} column(s) {_source_name(source)}'s settings need: "
+            + ", ".join(f"{what} (“{col}”)" for what, col in missing)
+            + f".{header_hint} Check it's the right file for this source, or update the column names on the Sources tab.",
+            detail=f"Columns in the file: {', '.join(cols[:40])}{'…' if len(cols) > 40 else ''}")
 
     upc_suffix_column = source.get("upc_suffix_column")
     out = pd.DataFrame(index=raw_df.index)
@@ -276,6 +387,15 @@ def map_and_clean(raw_df: pd.DataFrame, source: dict) -> pd.DataFrame:
         raw_upc = raw_df[upc_column].fillna("").astype(str).str.strip()
 
     out["RawUPC"] = raw_upc
+    # Excel turns a long UPC into "7.06128E+11" when the column isn't Text —
+    # the real digits are gone, so the whole file is turned away (it's
+    # almost always every row, and every one of them would be wrong).
+    sci = raw_upc[raw_upc.str.fullmatch(SCI_UPC)]
+    if len(sci):
+        raise FileProblem(
+            f"{len(sci):,} of its UPCs are in scientific notation (e.g. “{sci.iloc[0]}”) — Excel shortened them, so "
+            "their real digits are lost. Re-export the file with the UPC column formatted as Text, then upload it again.")
+    lettered = raw_upc[raw_upc.str.contains(r"[A-Za-z]", regex=True)]
     out["UPC"] = raw_upc.apply(lambda v: generic_clean_upc(v, int(source["strip_trailing_digits"])))
     for field, col in column_by_field.items():
         if col and col in raw_df.columns:
@@ -394,25 +514,137 @@ def map_and_clean(raw_df: pd.DataFrame, source: dict) -> pd.DataFrame:
         "rows_parsed": len(raw_df),
         "rows_staged": len(out),
         "dropped_invalid_upc": int(invalid_mask.sum()),
+        # UPCs with letters in them (bad UPCs — dropped with the invalid ones), and a few examples
+        "letter_upcs": len(lettered), "letter_upc_examples": lettered.head(3).tolist(),
         "dropped_duplicate_upc": int(duplicate_mask.sum()),
     }
 
     return out.drop(columns=["RawUPC"]), stats, rejected_df
 
 
+# ---------------------------------------------------------------------------
+# Which UPCs each source's files have listed, and for how many uploads in a
+# row a UPC has been missing from its source's file — so items that stopped
+# appearing can be reviewed (and, if no file has them any more, removed).
+# ---------------------------------------------------------------------------
+UPC_SEEN_DDL = """
+IF OBJECT_ID('dbo.source_upc_seen') IS NULL
+CREATE TABLE dbo.source_upc_seen (
+    source_key NVARCHAR(50) NOT NULL,
+    upc VARCHAR(20) NOT NULL,
+    first_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    last_seen_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    last_file NVARCHAR(400) NULL,
+    missed_uploads INT NOT NULL DEFAULT 0,
+    CONSTRAINT PK_source_upc_seen PRIMARY KEY (source_key, upc)
+)"""
+
+
+DELETED_RETURN_DDL = """
+IF COL_LENGTH('dbo.deleted_upcs', 'returned_at') IS NULL
+    ALTER TABLE dbo.deleted_upcs ADD returned_at DATETIME2 NULL, returned_file NVARCHAR(400) NULL"""
+
+
+def mark_deleted_returning(conn, source_key: str, filename: str) -> int:
+    """A deleted UPC that a newly saved file lists comes back: a Merge no longer
+    leaves it out, and once it's in the item master it's compared with how it
+    was when deleted (see dept_mapping.settle_returned_items)."""
+    from itemmaster import upload_reports
+    conn.execute(text(DELETED_RETURN_DDL))
+    upload_reports.ensure_tables(conn)
+    # (a UPC combined into another item stays out, whatever a file lists)
+    return conn.execute(text(
+        "UPDATE dbo.deleted_upcs SET returned_at = SYSUTCDATETIME(), returned_file = :f "
+        "WHERE returned_at IS NULL AND combined_into IS NULL "
+        "AND upc IN (SELECT upc FROM dbo.raw_items WHERE source_key = :sk)"),
+        {"sk": source_key, "f": filename}).rowcount
+
+
+def ensure_upc_seen(conn) -> None:
+    """Creates the table the first time, filled from each source's current
+    rows (all of them "seen in its latest file", missed 0)."""
+    created = conn.execute(text("SELECT OBJECT_ID('dbo.source_upc_seen')")).scalar() is None
+    if created:
+        conn.execute(text(UPC_SEEN_DDL))
+        conn.execute(text(
+            "INSERT INTO dbo.source_upc_seen (source_key, upc, first_seen_at, last_seen_at, last_file, missed_uploads) "
+            "SELECT r.source_key, r.upc, MIN(r.loaded_at), MIN(r.loaded_at), MAX(u.filename), 0 FROM dbo.raw_items r "
+            "LEFT JOIN dbo.source_raw_uploads u ON u.source_key = r.source_key GROUP BY r.source_key, r.upc"))
+
+
+def record_upc_seen(conn, source_key: str, filename: str, new_file: bool = True) -> None:
+    """After a source's rows were replaced (raw_items now holds exactly its new
+    file): every UPC in it is seen now; with a new file, every UPC it used to
+    list but doesn't any more has missed one more upload."""
+    ensure_upc_seen(conn)
+    if new_file:
+        conn.execute(text(
+            "UPDATE s SET missed_uploads = missed_uploads + 1 FROM dbo.source_upc_seen s WHERE s.source_key = :sk "
+            "AND NOT EXISTS (SELECT 1 FROM dbo.raw_items r WHERE r.source_key = :sk AND r.upc = s.upc)"), {"sk": source_key})
+    conn.execute(text(
+        """MERGE dbo.source_upc_seen AS t
+           USING (SELECT DISTINCT upc FROM dbo.raw_items WHERE source_key = :sk) AS src
+           ON t.source_key = :sk AND t.upc = src.upc
+           WHEN MATCHED THEN UPDATE SET last_seen_at = SYSUTCDATETIME(), missed_uploads = 0, last_file = :f
+           WHEN NOT MATCHED THEN INSERT (source_key, upc, last_file) VALUES (:sk, src.upc, :f);"""),
+        {"sk": source_key, "f": filename})
+
+
+def load_upc_seen(engine, source_key: str = None) -> pd.DataFrame:
+    """The seen-history rows (one source's, or all), for the "not in the file
+    any more" lists."""
+    with engine.begin() as conn:
+        ensure_upc_seen(conn)
+        return pd.read_sql(text(
+            "SELECT source_key, upc, last_seen_at, last_file, missed_uploads FROM dbo.source_upc_seen"
+            + (" WHERE source_key = :sk" if source_key else "")), conn, params={"sk": source_key} if source_key else {})
+
+
+SIGNATURE_COLUMNS = ["UPC", "Description", "Brand", "Department", "Category", "Subcategory", "Pack", "Size", "UOM"]
+
+
+def rows_signature(cleaned_df: pd.DataFrame) -> str:
+    """A fingerprint of a cleaned file's rows — the same rows give the same
+    fingerprint, whatever the file is called or the order its rows are in."""
+    import hashlib
+    df = cleaned_df.reindex(columns=SIGNATURE_COLUMNS)
+    df = df.astype(object).where(df.notna(), "").astype(str).apply(lambda s: s.str.strip())
+    df = df.sort_values(SIGNATURE_COLUMNS, kind="stable")
+    return hashlib.sha1(df.to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def current_signature(engine, source_key: str) -> str:
+    """The same fingerprint for the rows a source has now (its last saved file)."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text(
+            "SELECT upc AS UPC, description AS Description, brand AS Brand, department AS Department, "
+            "category AS Category, subcategory AS Subcategory, pack AS Pack, size AS Size, uom AS UOM "
+            "FROM dbo.raw_items WHERE source_key = :sk"), conn, params={"sk": source_key})
+    return rows_signature(df)
+
+
 def stage_source(engine, source_key: str, cleaned_df: pd.DataFrame, rejected_df: pd.DataFrame,
-                  stats: dict, uploaded_by: str = None, original_filename: str = None,
-                  on_retry=None) -> int:
+                 stats: dict, uploaded_by: str = None, original_filename: str = None,
+                 on_retry=None, new_file: bool = True, report: dict = None) -> int:
     """Replaces this source's staged rows in raw_items with cleaned_df, and
     permanently records what happened (row counts + every rejected row with
     a reason) in ingestion_log / ingestion_rejected_rows — every upload,
     not just the first one, so a reviewer can always see why a row from
     any month's file didn't make it in. Returns the new ingestion_log id.
     Retries a transient connection timeout (e.g. Azure SQL serverless
-    waking up from idle) via robust_begin — see db.py."""
+    waking up from idle) via robust_begin — see db.py.
+
+    report: {"kind": "manual" | "auto", "title": ...} — this upload goes into
+    an upload report (see upload_reports); the report's id is put in
+    report["id"], so the next file of the same upload joins the same report."""
     from itemmaster.db import robust_begin
+    from itemmaster import upload_reports
 
     with robust_begin(engine, on_retry=on_retry) as conn:
+        if report is not None:
+            if not report.get("id"):
+                report["id"] = upload_reports.start_report(conn, report.get("kind", "manual"), uploaded_by, report.get("title"))
+            upload_reports.capture_before(conn, report["id"], source_key)
         conn.execute(text("DELETE FROM dbo.raw_items WHERE source_key = :sk"), {"sk": source_key})
 
         if not cleaned_df.empty:
@@ -458,6 +690,15 @@ def stage_source(engine, source_key: str, cleaned_df: pd.DataFrame, rejected_df:
             to_insert["source_key"] = source_key
             to_insert = to_insert.replace({"": None})
             to_insert.to_sql("ingestion_rejected_rows", conn, schema="dbo", if_exists="append", index=False, chunksize=1000)
+
+        # (new_file=False: the same file re-read with new settings — not an upload anything "missed",
+        # and not a file bringing a deleted item back)
+        record_upc_seen(conn, source_key, original_filename, new_file=new_file)
+        if new_file:
+            mark_deleted_returning(conn, source_key, original_filename)
+        if report is not None:
+            report.setdefault("sources", {})[source_key] = upload_reports.record_after(
+                conn, report["id"], source_key, original_filename, log_id, int(stats.get("rows_staged") or len(cleaned_df)))
 
     from itemmaster.dept_mapping import log_activity  # (here: dept_mapping imports this module's neighbours)
     log_activity(engine, uploaded_by, "Uploads & Merge", f"Uploaded {original_filename or 'a file'}", source_key,

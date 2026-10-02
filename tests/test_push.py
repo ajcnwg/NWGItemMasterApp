@@ -101,6 +101,8 @@ try:
     dm.delete_pending_upc_changes(e, list(staged))
     dm.clear_recent_moves_for_combo(e, BO["combo_id"])
     check(where_is(BO["combo_id"]) == ["Decided (Broken Out — Manually Decided)"], f"pushed -> {where_is(BO['combo_id'])}")
+    # the app's Department push syncs the pushed groups' items (Merge only syncs the items it adds)
+    dm.sync_item_departments(e, set(dm.combo_member_upcs(e, [CW["combo_id"], UM["combo_id"]])) | set(staged))
 
     print("\n=== 3. Real Merge: engine re-run + push to the live item master ===")
     t = time.time()

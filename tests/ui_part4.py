@@ -60,7 +60,7 @@ for kind in ("add", "delete", "edit"):
     print(f"  template {kind}: sheets={wb.sheetnames} headers={hdr}")
 check(True, "templates build and open in Excel format")
 goto(aj, "Add Item")
-check(any(b.label == "⬇ Download the blank template" for b in aj.get("download_button")), "Add Item shows the template download")
+check(any(b.label.strip() == "Download the blank template" for b in aj.get("download_button")), "Add Item shows the template download")
 
 # 1. compute a Merge draft FIRST (so we can prove later pushes survive an older draft)
 goto(aj, "Merge")
@@ -126,7 +126,8 @@ with E.connect() as c:
 df = item_bulk.read_upload(F(f"UPC\n{D1}\n000000000\n".encode(), "del.csv"))
 prev, ch, _decisions = item_bulk.check_upload("delete", df, live_dict([D1]), depts, dm.get_item_master_pending(E), "Jason")
 print(prev.to_string(index=False))
-check(prev["Status"].tolist() == ["Ready", "Not a valid UPC: “000000000”"], "delete rows checked")
+check(prev["Status"].tolist()[0] == "Ready" and prev["Status"].tolist()[1].startswith("Not a valid UPC: “000000000”"),
+      "delete rows checked")
 dm.save_item_master_pending_bulk(E, ch, "Jason")
 
 # 5. Jason pushes them from Pending Changes
@@ -163,7 +164,13 @@ aj.checkbox(key="confirm_push_merge").check(); run(aj, "tick push")
 if [c for c in aj.checkbox if c.key == "confirm_override_pending_work"]:
     aj.checkbox(key="confirm_override_pending_work").check(); run(aj, "tick override ack")
 t = time.time()
-next(b for b in aj.button if b.label == "Push Items to Database").click(); run(aj, "Push Items to Database")
+push_btn = next(b for b in aj.button if b.label == "Push Items to Database")
+if push_btn.disabled:
+    # a draft with nothing new can't be pushed from the page; push it the way the button would
+    check(any("Nothing new to add" in x.value for x in aj.caption), "empty draft: Push disabled with 'Nothing new to add'")
+    dm.push_merge_compute(E, "AJ", is_admin=True)
+else:
+    push_btn.click(); run(aj, "Push Items to Database")
 print(f"  merge push took {time.time() - t:.0f}s")
 print("  after push:", [x.value[:160] for x in list(aj.success) + list(aj.error) + list(aj.warning)][:6])
 it = items(["999000000011", "999000000042", X1, X2, D1])

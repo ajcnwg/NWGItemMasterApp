@@ -19,11 +19,8 @@ import pandas as pd
 from sqlalchemy import text
 
 from itemmaster import dept_mapping
-from itemmaster.ingest import map_and_clean, read_raw_file, save_raw_upload, stage_source
+from itemmaster.ingest import FileProblem, map_and_clean, read_raw_file, save_raw_upload, stage_source
 
-# A file whose row count falls below this share of the source's previous
-# upload is held back as suspicious (a truncated export, the wrong sheet…).
-MIN_ROW_SHARE = 0.5
 
 
 def _norm(s: str) -> str:
@@ -82,16 +79,27 @@ def check_file(engine, file, sources: pd.DataFrame, source_key: str = None) -> d
             file.seek(0)
         raw = read_raw_file(file if hasattr(file, "read") else _PathFile(file), src)
         cleaned, stats, rejected = map_and_clean(raw, src)
+    except FileProblem as e:
+        rep.update(status="error", note=str(e))
+        return rep
     except Exception as e:
         rep.update(status="error", note=f"couldn't read it with {source_key}'s settings: {e}")
         return rep
     prev = _previous_rows(engine, source_key)
     rep.update(rows=stats["rows_staged"], previous_rows=prev, stats=stats,
                _raw=raw, _cleaned=cleaned, _rejected=rejected, _src=src)
+    if stats.get("letter_upcs"):
+        rep["note"] = ((rep["note"] + "; ") if rep["note"] else "") + (
+            f"{stats['letter_upcs']:,} row(s) with letters in the UPC left out (e.g. “{stats['letter_upc_examples'][0]}”)")
     if stats["rows_staged"] == 0:
-        rep.update(status="error", note="no usable rows (check the sheet name, header row and UPC column)")
-    elif prev and stats["rows_staged"] < MIN_ROW_SHARE * prev:
-        rep.update(status="suspicious", note=f"only {stats['rows_staged']:,} rows vs {prev:,} last time")
+        rep.update(status="error", note=f"none of its {stats['rows_parsed']:,} rows has a usable UPC in column "
+                                        f"“{src.get('upc_column')}” — check it's the right file, and the header row "
+                                        "and UPC column on the Sources tab")
+        return rep
+    # The same rows as the source has now (the same file again, maybe renamed): nothing to do.
+    from itemmaster.ingest import current_signature, rows_signature
+    if rows_signature(cleaned) == current_signature(engine, source_key):
+        rep.update(status="same", note=f"every row matches {source_key}'s current data — nothing new, nothing dropped")
     return rep
 
 
@@ -105,13 +113,15 @@ class _PathFile:
         return str(self.path)
 
 
-def ingest_checked(engine, rep: dict, actor: str) -> None:
+def ingest_checked(engine, rep: dict, actor: str, report: dict = None) -> None:
     """Saves a file checked by check_file: replaces the source's raw rows,
-    logs the upload, and keeps the as-read file for later re-runs."""
+    logs the upload, and keeps the as-read file for later re-runs. report:
+    the upload report the file goes into (shared by every file of one run)."""
     from itemmaster.dept_mapping import activity_via
     with activity_via("Monthly refresh"):
         stage_source(engine, rep["source_key"], rep["_cleaned"], rep["_rejected"], rep["stats"],
-                     uploaded_by=actor, original_filename=rep["file"])
+                     uploaded_by=actor, original_filename=rep["file"],
+                     report=report if report is not None else {"kind": "manual"})
     save_raw_upload(engine, rep["source_key"], rep["_raw"], rep["file"], actor)
     rep["status"] = "ingested"
 
@@ -127,22 +137,35 @@ def compute_draft(engine, actor: str) -> dict | None:
     return {"item_count": len(final_df), **meta}
 
 
-def run(engine, files: list, actor: str, push: bool = False, allow_suspicious: bool = False, log=print) -> dict:
-    """The whole refresh. Suspicious or unreadable files are never ingested;
-    with push=True nothing is pushed at all if any file was held back
-    (unless allow_suspicious), so a bad export can't go live unattended."""
+def run(engine, files: list, actor: str, push: bool = False, allow_suspicious: bool = False, log=print) -> dict:  # noqa: ARG001 (allow_suspicious: no longer used)
+    """The whole refresh. A file that can't be read, doesn't fit its source's
+    settings, or shares a source with another file is never ingested; with
+    push=True nothing is pushed at all if any file was held back, so a bad
+    export can't go live unattended."""
     sources = load_sources(engine)
     reports = []
     for f in files:
         rep = check_file(engine, f, sources)
         log(f"{rep['file']}: {rep['status']} — {rep.get('source_key') or '?'} {rep['note']}".rstrip())
         reports.append(rep)
-    held = [r for r in reports if r["status"] in ("suspicious", "error")]
+    # Two usable files for the same source: which one is right can't be
+    # guessed (the second would silently replace the first) — hold both back.
+    # (a source's current file plus a different one is just as ambiguous)
+    usable = [r["source_key"] for r in reports if r["status"] in ("ready", "same")]
     for r in reports:
-        if r["status"] == "ready" or (r["status"] == "suspicious" and allow_suspicious):
-            ingest_checked(engine, r, actor)
+        if r["status"] in ("ready", "same") and usable.count(r["source_key"]) > 1:
+            r.update(status="error", note=f"more than one file for {r['source_key']} — keep only one of them")
+            log(f"{r['file']}: held back — {r['note']}")
+    held = [r for r in reports if r["status"] == "error"]
+    for r in reports:
+        if r["status"] == "same":
+            log(f"  {r['file']}: same as {r['source_key']}'s current data — left as it is")
+    report = {"kind": "auto", "title": "Monthly refresh (script)"}
+    for r in reports:
+        if r["status"] == "ready":
+            ingest_checked(engine, r, actor, report)
             log(f"  ingested {r['rows']:,} rows into {r['source_key']}")
-    out = {"files": [{k: v for k, v in r.items() if not k.startswith("_")} for r in reports]}
+    out = {"files": [{k: v for k, v in r.items() if not k.startswith("_")} for r in reports], "report_id": report.get("id")}
     if not any(r["status"] == "ingested" for r in reports):
         log("Nothing ingested — no Merge draft computed.")
         return out
@@ -151,7 +174,7 @@ def run(engine, files: list, actor: str, push: bool = False, allow_suspicious: b
     d = out["draft"] or {}
     log(f"  draft: {d.get('added_count', 0):,} new item(s) to add; existing items untouched "
         f"({d.get('changed_count', 0):,} differ in the files — ignored; {d.get('removed_count', 0):,} no longer in any file — kept)")
-    if push and held and not allow_suspicious:
+    if push and held:
         log("Not pushing: some files were held back. Review them, then push from the Merge tab.")
     elif push:
         log("Pushing the Merge (safety snapshot, then Department Review carries decisions forward)...")

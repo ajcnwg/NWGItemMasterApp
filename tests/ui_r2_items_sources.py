@@ -175,7 +175,8 @@ try:
     a.button(key="push_source_pending").click(); run(a, "Push")
     check(bool(q("SELECT 1 FROM dbo.sources WHERE source_key = 'zz_r2'")), "the new source exists")
     goto(a, "Upload & Ingest")
-    check("zz_r2" in [s_ for s_ in a.selectbox if s_.label == "Source"][0].options, "listed on Upload & Ingest")
+    hist_src = [s_ for s_ in a.selectbox if s_.key == "upload_hist_src"]
+    check(bool(hist_src) and any("zz_r2" in o for o in hist_src[0].options), "listed on Upload & Ingest")
     clean(a, "Upload & Ingest")
 
     print("\n== 3. Items: add, delete, UPC override — take one back, push the rest, restore")
@@ -185,8 +186,9 @@ try:
     [x for x in j.button if x.label == "Add Item"][0].click(); run(j, "Jason adds an item")
     victim = q("SELECT TOP 1 upc, description FROM dbo.items WHERE source_key = 'cs_ca' ORDER BY upc")[0]
     goto(j, "Delete Item")
-    [t for t in j.text_input if t.label.startswith("Search by description or UPC to find")][0].input(victim[0]); run(j, "search")
-    [x for x in j.button if x.label == "Delete Item"][0].click(); run(j, "stage the delete")
+    j.text_input(key="delete_search").input(victim[0]); run(j, "search")
+    tick_upcs(j, "delete_pick_grid", "Delete", [victim[0]]); run(j, "tick it")
+    j.button(key="delete_pick_grid_submit").click(); run(j, "stage the delete")
     ov = q("SELECT TOP 1 i.upc, i.department FROM dbo.items i WHERE i.department = 'GROCERY' AND i.upc NOT IN "
            "(SELECT upc FROM dbo.manual_overrides) ORDER BY i.upc DESC")[0]
     goto(j, "UPC Overrides")
@@ -206,19 +208,17 @@ try:
           and bool(q("SELECT 1 FROM dbo.manual_overrides WHERE upc = :u", u=ov[0])), "the override is live and pinned")
     check(bool(q("SELECT 1 FROM dbo.items WHERE upc = :u", u=victim[0])), "the taken-back delete didn't happen")
     goto(j, "Delete Item")
-    [t for t in j.text_input if t.label.startswith("Search by description or UPC to find")][0].input("999000111222"); run(j, "search")
-    [x for x in j.button if x.label == "Delete Item"][0].click(); run(j, "stage deleting the test item")
+    j.text_input(key="delete_search").input("999000111222"); run(j, "search")
+    tick_upcs(j, "delete_pick_grid", "Delete", ["999000111222"]); run(j, "tick it")
+    j.button(key="delete_pick_grid_submit").click(); run(j, "stage deleting the test item")
     goto(a, "Pending Changes")
     a.checkbox(key="confirm_push_item_master").check(); run(a, "tick")
     a.button(key="push_item_master_pending").click(); run(a, "push the delete")
     check(not q("SELECT 1 FROM dbo.items WHERE upc = '999000111222'"), "deleted")
     goto(a, "Delete Item")
-    rs = [t for t in a.text_input if t.key == "restore_search"]
-    if rs:
-        rs[0].input("999000111222"); run(a, "find it in Deleted items")
-    rb = [x for x in a.button if x.label == "Restore Item"]
-    if rb:
-        rb[0].click(); run(a, "Restore Item")
+    a.text_input(key="restore_search").input("999000111222"); run(a, "find it in Deleted items")
+    tick_upcs(a, "restore_pick_grid", "Restore", ["999000111222"]); run(a, "tick it")
+    a.button(key="restore_pick_grid_submit").click(); run(a, "Restore")
     check(bool(q("SELECT 1 FROM dbo.items WHERE upc = '999000111222'")), "restored")
     clean(a, "Delete Item")
 
@@ -226,13 +226,10 @@ try:
     f, new_ca = file_with_new_items("cs_ca", 3, "CS CA Daily Order Guide 9.28.26.xlsx")
     check(len(new_ca) == 3, f"test file has 3 new items after cleaning ({new_ca})")
     goto(a, "Upload & Ingest")
-    [s for s in a.selectbox if s.label == "Source"][0].select("cs_ca"); run(a, "pick C&S CA")
-    UPLOAD["Upload the file for"] = f; run(a, "upload the file"); del UPLOAD["Upload the file for"]
-    save = [x for x in a.button if (x.label or "").startswith("Save ")]
-    check(bool(save), "file read — Save button shown")
-    UPLOAD["Upload the file for"] = f
-    save[0].click(); run(a, "Save to raw_items"); del UPLOAD["Upload the file for"]
-    merge_push(a)
+    UPLOAD["mr_files_"] = [f]; run(a, "upload the file")
+    save = [x for x in a.button if (x.label or "").startswith("Save 1 file")]
+    check(bool(save) and "add 3 new item" in save[0].label, f"file read — Save (and add) button shown ({save[0].label if save else None})")
+    save[0].click(); run(a, "Save — adds the new items in one step"); del UPLOAD["mr_files_"]
     live = {r[0]: r[1] for r in q("SELECT upc, department FROM dbo.items WHERE upc IN ('%s')" % "','".join(new_ca))}
     check(set(live) == set(new_ca), f"the 3 new C&S CA items are in the item master ({live})")
     clean(a, "Merge")
@@ -244,17 +241,17 @@ try:
     UPLOAD["mr_files_"] = [f2, f3]; run(a, "drop 2 files")
     tbl = [d.value for d in a.dataframe if hasattr(d.value, "columns") and "Status" in d.value.columns]
     status = dict(zip(tbl[0]["File"], tbl[0]["Status"])) if tbl else {}
-    check(status.get(f2.name) == "Ready" and "No matching source" in status.get(f3.name, ""), f"statuses: {status}")
-    [x for x in a.button if (x.label or "").startswith("Ingest 1 file")][0].click(); run(a, "Ingest + compute the draft")
+    check(status.get(f2.name) == "Ready" and status.get(f3.name) == "Which source?", f"statuses: {status}")
+    [x for x in a.button if (x.label or "").startswith("Save 1 file")][0].click(); run(a, "Save — adds the new items")
     del UPLOAD["mr_files_"]
-    merge_push(a)
     check(len(q("SELECT upc FROM dbo.items WHERE upc IN ('%s')" % "','".join(new_pnw))) == 2, "C&S PNW's 2 new items are live")
 
     print("\n== 6. Activity report has all of it")
     log = dm.list_activity(E)
     areas = set(log["area"])
     check({"Sources", "Items", "Pushed live", "Uploads & Merge"} <= areas, f"areas: {sorted(areas)}")
-    check(any(log["action"].str.startswith("Uploaded CS CA")) and any(log["action"] == "Pushed a Merge"), "uploads and Merge pushes recorded")
+    check(any(log["action"].str.startswith("Uploaded CS CA")) and any(log["action"].str.startswith("Added ")),
+          "uploads and the new items they added are recorded")
     check(any((log["actor"] == "Jason") & log["action"].str.contains("Took back")), "Jason's take-back recorded")
     goto(a, "Activity"); clean(a, "Activity")
 finally:

@@ -8,9 +8,11 @@ checks can be tested directly.
 
 import io
 
+import re
+
 import pandas as pd
 
-from itemmaster.ingest import INVALID_UPC, clean_upc
+from itemmaster.ingest import INVALID_UPC, clean_upc, invalid_upc_reason
 
 FIELDS = ["description", "department", "category", "subcategory", "brand", "pack", "size", "uom"]
 HEADERS = {
@@ -63,16 +65,33 @@ def _norm_header(h) -> str:
     return "".join(ch for ch in str(h).lower() if ch.isalnum())
 
 
+def describe_read_error(name: str, e: Exception) -> str:
+    """Plain words for why a spreadsheet couldn't be read."""
+    kind = type(e).__name__
+    if kind in ("BadZipFile", "InvalidFileException") or "zip file" in str(e).lower():
+        return (f"{name} isn't a readable Excel file — it may be damaged, still open, or another kind of "
+                "file renamed to .xlsx. Save it from Excel as .xlsx and upload it again.")
+    if kind == "EmptyDataError":
+        return f"{name} is empty."
+    if kind in ("UnicodeDecodeError", "ParserError"):
+        return (f"{name} couldn't be read as a CSV. Save it from Excel as .xlsx (or “CSV UTF-8”) "
+                "and upload it again.")
+    return f"{name} couldn't be read ({str(e)[:160]})."
+
+
 def read_upload(file) -> pd.DataFrame:
     """The uploaded rows, with columns renamed to the internal field names.
     Reads the "Items" sheet if there is one, otherwise the first sheet."""
     name = getattr(file, "name", "") or ""
-    if name.lower().endswith(".csv"):
-        df = pd.read_csv(file, dtype=str, keep_default_na=False)
-    else:
-        xl = pd.ExcelFile(file)
-        sheet = "Items" if "Items" in xl.sheet_names else xl.sheet_names[0]
-        df = xl.parse(sheet, dtype=str, keep_default_na=False)
+    try:
+        if name.lower().endswith(".csv"):
+            df = pd.read_csv(file, dtype=str, keep_default_na=False)
+        else:
+            xl = pd.ExcelFile(file)
+            sheet = "Items" if "Items" in xl.sheet_names else xl.sheet_names[0]
+            df = xl.parse(sheet, dtype=str, keep_default_na=False)
+    except Exception as e:
+        raise ValueError(describe_read_error(name, e)) from e
     lookup = {_norm_header(v): k for k, v in HEADERS.items()}
     lookup.update({"upccode": "upc", "itemdescription": "description", "dept": "department", "unitofmeasure": "uom"})
     df = df.rename(columns={c: lookup[_norm_header(c)] for c in df.columns if _norm_header(c) in lookup})
@@ -108,8 +127,12 @@ def check_upload(kind: str, df: pd.DataFrame, live: dict, departments: list, pen
         status = "Ready"
         change = None
         goes = ""
-        if upc == INVALID_UPC:
-            status = f"Not a valid UPC: “{raw}”"
+        raw_s = str(raw).strip()
+        if re.fullmatch(r"\d+(\.\d+)?[eE]\+?\d+", raw_s):
+            status = (f"Excel shortened this UPC to “{raw_s}” — format the UPC column as Text in Excel, "
+                      "type the full UPC again, and re-upload")
+        elif upc == INVALID_UPC:
+            status = f"Not a valid UPC: “{raw}” — {invalid_upc_reason(raw)}"
         elif upc in seen:
             status = "Duplicate — this UPC is on an earlier row too"
         elif upc in pending and pending[upc].get("staged_by") != actor:
@@ -157,6 +180,8 @@ def check_upload(kind: str, df: pd.DataFrame, live: dict, departments: list, pen
                 goes = " + ".join(("Broken Out item decision" if p.startswith("Department →") else "UPC override")
                                   for p in parts)
         if change is not None:
+            # a missing value (NaN from the item master's numbers) is a blank, not a number the database can't take
+            change = {k: (None if v is None or (isinstance(v, float) and pd.isna(v)) else v) for k, v in change.items()}
             if change.get("department"):
                 change["department"] = canon.get(str(change["department"]).upper(), change["department"])
             changes[upc] = change

@@ -7,6 +7,11 @@ showErrorDetails = "none"
 # The app never uses "magic" (bare expressions auto-displayed); turning it off
 # saves Streamlit re-parsing all of app.py on every run.
 magicEnabled = false
+# Streamlit otherwise runs a full garbage collection after EVERY run (even a
+# tiny one, like opening "Show affected items"). With the auto-matching data
+# held in memory that takes ~2 seconds each time. Python still collects
+# garbage on its own as usual.
+postScriptGC = false
 
 [server]
 # Code changes are picked up on the next click (reloads changed code files too).

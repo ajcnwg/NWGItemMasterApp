@@ -27,7 +27,7 @@ st_mod.file_uploader = lambda label, *a, key=None, **k: type("U", (io.BytesIO,),
 try:
     j = session("jason"); run(j, "load"); goto(j, "UPC Overrides")
     check(not any(e.label.startswith("🏷️ Setting Departments") for e in j.expander), "separate Department upload is gone")
-    check(any(e.label.startswith("📄 Changing many items (Departments or any other fields)") for e in j.expander), "one combined upload")
+    check(any("Changing many items (Departments or any other fields)" in e.label for e in j.expander), "one combined upload")
     summ = [m.value for m in j.markdown if "Broken Out item decision(s)" in m.value]
     print("  ", summ)
     check(summ and summ[0].startswith("**6 ready** (4 UPC override(s), 3 Broken Out item decision(s)) · 1 no change")

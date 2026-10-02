@@ -103,7 +103,8 @@ check(q("SELECT COUNT(*) FROM dbo.raw_items WHERE source_key='unfi_natural' AND 
       "UNFI Pack/Size/UOM ingested")
 _st.cache_data.clear()
 goto(aj, "Merge")
-check(any("unfi_natural" in w.value for w in aj.warning), "Merge tab flags UNFI's raw data as newer than the last Merge")
+check(any("unfi_natural" in (w.value or "") for w in list(aj.warning) + list(aj.markdown)),
+      "Merge tab flags UNFI's raw data as newer than the last Merge")
 t = time.time()
 next(b for b in aj.button if b.label == "Compute Merge").click(); run(aj, "Compute Merge")
 meta = dm.get_merge_compute_meta(E)

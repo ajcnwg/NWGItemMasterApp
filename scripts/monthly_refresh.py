@@ -15,7 +15,7 @@ inbox/processed/<date>/, held-back ones to inbox/held/<date>/.
 Without --push the draft waits on the Merge tab for an admin to review and
 push (recommended). With --push it goes live straight away (safety
 snapshot first, then this month's snapshot) — but never if a file was held
-back as unreadable or suspiciously small.
+back as unreadable or not matching its source.
 """
 
 import argparse
@@ -35,8 +35,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--inbox", required=True, help="folder holding this month's distributor files")
     ap.add_argument("--push", action="store_true", help="push the Merge live after computing it")
-    ap.add_argument("--allow-suspicious", action="store_true",
-                    help="also ingest files much smaller than the source's last upload")
+    ap.add_argument("--allow-suspicious", action="store_true", help=argparse.SUPPRESS)  # (no longer used; kept so old schedules still run)
     ap.add_argument("--actor", default="Monthly refresh script", help="name recorded as who did it")
     ap.add_argument("--keep-files", action="store_true", help="leave files in the inbox afterwards")
     ap.add_argument("--check-only", action="store_true",
@@ -65,8 +64,7 @@ def main():
             log(f"{r['file']}: {r['status']} — {r.get('source_key') or '?'} {r['note']}"
                 + (f" · {r['rows']:,} rows (last time {r['previous_rows'] or 0:,})" if r.get("rows") is not None else ""))
         return 0
-    out = monthly_refresh.run(get_engine(), files, args.actor, push=args.push,
-                              allow_suspicious=args.allow_suspicious, log=log)
+    out = monthly_refresh.run(get_engine(), files, args.actor, push=args.push, log=log)
     if not args.keep_files:
         for f in out["files"]:
             dest = inbox / ("processed" if f["status"] == "ingested" else "held") / stamp

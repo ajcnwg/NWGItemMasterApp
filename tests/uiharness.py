@@ -118,3 +118,24 @@ def edit_grid(at, key, rows: dict):
     cur = GRID_EDITS.setdefault(el.proto.id, {"edited_rows": {}, "added_rows": [], "deleted_rows": []})
     for r, vals in rows.items():
         cur["edited_rows"].setdefault(str(r), {}).update(vals)
+
+
+def grid_key(at, prefix):
+    """The key of the grid whose key starts with prefix (tick tables add a
+    suffix naming the rows they show), or None."""
+    for el in walk(at.main):
+        if getattr(el, "type", "") == "dataframe" and (getattr(el, "key", None) or "").startswith(prefix):
+            return el.key
+    return None
+
+
+def tick_upcs(at, prefix, column, upcs) -> list:
+    """Ticks `column` on the rows of these UPCs in the tick table `prefix`;
+    returns the UPCs it found to tick."""
+    key = grid_key(at, prefix)
+    if key is None:
+        return []
+    shown = list(grid(at, key).value["UPC"])
+    found = [u for u in upcs if u in shown]
+    edit_grid(at, key, {shown.index(u): {column: True} for u in found})
+    return found

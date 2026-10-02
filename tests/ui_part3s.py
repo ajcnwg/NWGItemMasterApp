@@ -54,8 +54,15 @@ def save_strict_via_ui(rows_sql, label):
                            "VALUES (:s, :o, :t, 'AJ')"), r)
     st_mod.cache_data.clear()
     goto(aj, "Department Review", "Settings")
+    # (Save is enabled only after an edit: add a blank row — the save drops blank rows,
+    # so it saves exactly what's in the table now and re-runs the engine)
+    edit_grid(aj, "strict_departments_editor", {})
+    el = grid(aj, "strict_departments_editor")
+    GRID_EDITS[el.proto.id]["added_rows"] = [{"source_key": None, "old_department": None}]
+    run(aj, "edit the grid")
     t = _t.time()
     next(b for b in aj.button if b.label == "Save Strict Departments").click(); run(aj, label)
+    GRID_EDITS.pop(el.proto.id, None)
     print(f"  engine re-run took {_t.time() - t:.0f}s; toast:", [x.value for x in aj.toast])
 
 
