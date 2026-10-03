@@ -55,6 +55,7 @@ sugg = dm.get_combo_suggestions(E, [int(B.combo_id)])
 check(len({s["department"] for s in sugg.get(int(B.combo_id), [])}) == 2, "B is now disputed (2 departments)")
 
 # 4. jason's notifications show the dispute; View takes him to it
+__import__("streamlit").cache_resource.clear()  # (notifications are cached a minute; "since" no longer moves on a reload)
 jason = session("jason"); run(jason, "jason reload")
 side = [m.value for m in jason.sidebar.markdown] + [c.value for c in jason.sidebar.caption]
 check(any(lab(B) in x for x in side), "Jason's sidebar lists group B")

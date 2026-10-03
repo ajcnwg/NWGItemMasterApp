@@ -94,3 +94,39 @@ div[class*="st-key-dept_sort_desc_wrap"] label p { white-space: nowrap; }
   border-radius: 0.5rem;
   transition: box-shadow 0.8s ease;
 }
+
+/* Possible duplicate UPCs: the small ‹ › page buttons beside "page 1 of 19"
+   sit in narrow columns; Streamlit's side padding left no room for the arrow. */
+.st-key-dup_prev_top button, .st-key-dup_next_top button { padding-left: 0 !important; padding-right: 0 !important; min-width: 1.8rem; }
+
+/* Small windows (or the sidebar open on a laptop): the main area is narrow, so
+   rows rearrange instead of squeezing their buttons and labels to "Ov…".
+   Measured against the main area itself, not the whole window. */
+section[data-testid="stMain"] .block-container { container-type: inline-size; container-name: appmain; }
+@container appmain (max-width: 760px) {
+  /* every group card: its buttons move to their own full-width row, under the group's name */
+  [class*="st-key-card_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] { flex-wrap: wrap; row-gap: .4rem; }
+  [class*="st-key-card_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
+    flex: 1 1 100% !important; min-width: 100% !important; width: 100% !important;
+  }
+  /* (the Include tick stays a narrow column beside the group's name) */
+  [class*="st-key-card_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child:not(:last-child):has([data-testid="stCheckbox"]) {
+    flex: 0 0 auto !important; min-width: 0 !important; width: auto !important;
+  }
+  [class*="st-key-card_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2):not(:last-child) {
+    flex: 1 1 0 !important; min-width: 0 !important;
+  }
+  /* rows of three or more (filter bars, pagers, button rows): wrap onto a second line when they don't fit */
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) { flex-wrap: wrap; row-gap: .5rem; }
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:not(:has([data-testid="stCheckbox"]):not(:has(button, input[type="text"], [data-baseweb="select"]))) {
+    min-width: min(8.5rem, 100%);
+  }
+  /* a button's words wrap onto two lines instead of being cut to "…" */
+  [data-testid="stMain"] button p { white-space: normal !important; text-overflow: clip !important; overflow-wrap: break-word; }
+  [data-testid="stMain"] button div { overflow: visible !important; text-overflow: clip !important; }
+}
+
+/* The top bar (bell, Undo, Redo) sits in Streamlit's header strip, which is see-through:
+   scrolled content showed behind the buttons. Give the strip the page's own background
+   (inherited from the app, so it follows the light / dark theme). */
+[data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > div, header[data-testid="stHeader"] { background-color: inherit; }

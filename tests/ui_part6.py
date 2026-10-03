@@ -63,12 +63,12 @@ check(jason.text_input(key="dept_review_review_search").value == "kehe", "locked
 jason = session("jason"); run(jason, "reload")
 n_notes = sum(len(x) for x in dm.get_notifications(E, "Jason", dm.get_last_seen(E, "Jason")).values())
 has_search = any(t.key == "notif_search" for t in jason.sidebar.text_input)
-check(has_search == (n_notes > 8), f"search/type filters only with more than 8 notifications ({n_notes}, shown={has_search})")
+check(has_search == (n_notes > 8), f"search only with more than 8 notifications ({n_notes}, shown={has_search})")
 aj = session("aj"); run(aj, "AJ")
 aj.sidebar.segmented_control(key="notif_view").set_value("Team"); run(aj, "Team view")
-kinds = aj.sidebar.selectbox(key="notif_kind").options
-print("  type filter:", kinds)
-check(len(kinds) == 9, "type filter lists every kind")
+team = [e.label for e in aj.sidebar.expander]
+print("  Team view:", team)
+check(all(any(x.startswith(p) for x in team) for p in ("Eric", "Jason", "Kristi")), "Team view: one section per editor")
 # (the bell never hides the notifications — it only opens the sidebar, in the browser)
 jason.button(key="topbar_bell").click(); run(jason, "click the bell")
 check(any(m.value.startswith("### Notifications") for m in jason.sidebar.markdown), "notifications still showing")

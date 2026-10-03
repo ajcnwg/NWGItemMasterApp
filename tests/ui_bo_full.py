@@ -105,9 +105,13 @@ try:
     check(not any((b.key or "").startswith(f"force_release_claim_{CID}") for b in k.button), "Kristi has no Force release")
     a = session("aj"); run(a, "reload AJ"); open_group(a)
     check(any(b.key == f"force_release_claim_{CID}" for b in a.button), "AJ (admin) has Force release")
+    a.button(key=f"force_release_claim_{CID}").click(); run(a, "AJ force-releases Jason's claim")
+    __import__("streamlit").cache_resource.clear()  # (notifications are cached a minute)
     j2 = session("jason"); run(j2, "Jason reload")
-    check(any("working on this Broken Out group" in m.value for m in list(j2.sidebar.markdown) + list(j2.sidebar.caption)),
-          "Jason's notifications list the group he's working on")
+    check(any("released your claim" in m.value for m in list(j2.sidebar.markdown) + list(j2.sidebar.caption)),
+          "Jason is told AJ released his claim")
+    j = session("jason"); run(j, "Jason reload"); open_group(j)
+    j.button(key=f"claim_broken_out_{CID}").click(); run(j, "Jason claims it back")
     j.button(key=f"release_claim_{CID}").click(); run(j, "Jason releases")
     check(any(b.key == f"claim_broken_out_{CID}" for b in j.button), "released: Claim button back")
     j.button(key=f"claim_broken_out_{CID}").click(); run(j, "Jason claims again")

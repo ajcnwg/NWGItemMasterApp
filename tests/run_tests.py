@@ -73,13 +73,15 @@ SUITES = [
     'ui_errors',
     'ui_input_checks',
     'ui_upload_reports',
+    'ui_notifications',  # personal notifications: who hears what, and where Open goes
 ]
 
 # What a snapshot doesn't hold, in parent → child order (an upload log row
 # before its rejected rows).
 KEEP_TABLES = ["activity_log", "dept_settings_requests", "app_errors", "user_workspace", "user_last_seen",
                "raw_items", "source_raw_uploads", "ingestion_log", "ingestion_rejected_rows", "merge_added_items",
-               "source_upc_seen", "upload_reports", "upload_report_sources", "upload_report_items", "dup_not_duplicate", "notification_dismissals"]
+               "source_upc_seen", "upload_reports", "upload_report_sources", "upload_report_items", "dup_not_duplicate", "notification_dismissals",
+               "user_notifications"]
 BAK = "zz_testbak_"
 BEFORE_LABEL = "Before tests (restored when they finish)"
 
@@ -105,8 +107,9 @@ def backup(E) -> None:
     with E.begin() as c:
         ingest.ensure_upc_seen(c)
         upload_reports.ensure_tables(c)  # (so every table to keep exists)
-        from itemmaster.dept_mapping import NOTIF_DISMISS_DDL
+        from itemmaster.dept_mapping import NOTIF_DISMISS_DDL, USER_NOTES_DDL
         c.execute(text(NOTIF_DISMISS_DDL))
+        c.execute(text(USER_NOTES_DDL))
         for t in KEEP_TABLES:
             c.execute(text(f"SELECT * INTO dbo.{BAK}{t} FROM dbo.{t}"))
 
@@ -187,6 +190,10 @@ def main(argv) -> None:
         print((r.stdout.strip().splitlines() or [r.stderr[-400:]])[-1], flush=True)
         out = open(os.path.join(TESTS, "logs", "summary.txt"), "w", encoding="utf-8")
         totals = [0, 0]
+        # the first suite starts from #0 too, like every one after it (not from
+        # whatever happens to be staged right now, e.g. a workbook import)
+        dm.restore_snapshot(E, 0, "Tests")
+        put_back(E, keep_copies=True)
         for name in chosen:
             t = time.time()
             try:

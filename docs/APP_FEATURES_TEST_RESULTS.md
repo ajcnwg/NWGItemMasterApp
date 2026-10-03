@@ -232,10 +232,54 @@ Found in Department Review: the Approve / Suggest / Update buttons are cut off (
 | Merge offered Push for an empty draft | Push disabled; "Nothing new to add" | Code |
 | Rules caption said fixes are "staged" | Says they go live at once, with an Undo | Code |
 
-## Not changed (for you to decide)
+## Decided 2026-10-02 (the open questions)
 
-- **Approve all N on this page** takes ~1.5 s per group (16 s for 10) — each is staged and tracked for Undo one by one; making it one batch is a bigger change.
-- **Admin editing someone else's Broken Out items on Pending Changes** sends them as suggestions to the owner (admins force through with Override). Should admins change them directly instead?
+| Question | Your answer | What changed | Checked |
+|---|---|---|---|
+| Approve all N on this page was ~1.5 s per group | Make it faster; each card's Undo… takes back one group, the top-bar Undo takes back all of them | One transaction for the whole page (25 groups: ~37 s -> ~1.3 s). The top-bar Undo / Redo now takes back everything one click did (25 groups: ~1 s). A group already taken back by its own Undo… is skipped quietly | Browser: approve 25, card Undo… on one, top-bar Undo (put that one back), top-bar Undo took all 25 back; disputes / agreements match one-by-one |
+| Admin changing someone else's Broken Out item on Pending Changes | Admin replaces it | An admin's pick replaces the owner's staged one; the owner gets a "changed by" notice; the top-bar Undo puts theirs back. Editors still send suggestions | Browser: Kristi's DELI -> AJ's DAIRY, notice recorded, Undo restored Kristi's |
+| Activity "Groups touched" (70) vs By group (49) | Match the list | "Groups touched" (and the per-person Groups column) count exactly the By group rows | Browser: 77 = 77 |
+| Upload Reports tab counts lagged | Count inside the tab | Plain tab names; each tab's first line is a live count (pairs to review; made-up UPCs and how many are staged; items no file has) | Browser: Not a duplicate -> 186 to 185 at once, same tab |
+| Item Master Department showed a faded "None" | Items should always have one; an option is fine | Blank departments show "(no department)"; picking it on an item that has one is refused with a message | Browser: label shown; FROZEN kept with the message; picking FROZEN on a blank item stages normally |
+
+Also fixed while checking: the grid's hover toolbar covered Item Master's Discard button (more room under the bar), and the small ‹ › page buttons on Possible duplicate UPCs showed empty (no room for the arrow).
+
+Still open:
 - **Push stays blocked while the import has an open "Needs your choice"** — your rule from 2026-09-29.
-- **Activity**: "Groups touched 70" counts every group any change touched; "By group" lists 49 — they count different things.
-- **Upload Reports** tab counts (e.g. "Possible duplicate UPCs (186)") update on the next full page run, not instantly.
+- 26,231 items have no department today (mostly items in groups still waiting for a decision) — they show "(no department)" in the grid.
+- The Broken Out "Change items" grid's **New Department** column shows Streamlit's faded "None" until you pick one (means "nothing picked").
+
+## Mass-change audit 2026-10-02 (notifications at scale)
+
+Setup (all four reviewer accounts, the app's own functions and Undo records): Approve all on 320 groups (Jason / Kristi / Eric),
+~110 disputes, 66 undo requests, 45 admin overrides of others' decisions, 60 Break Outs with ~485 item decisions and 126 item
+suggestions on others' items, 15 of Jason's groups moved by AJ, 9 settings requests; then **1,500 group changes by Jason, ~3,000
+item decisions by Kristi**, and one push by AJ of 1,527 group decisions + the item decisions (77,621 items). Eric was the third
+account, only watching.
+
+| Found | Fixed | Checked |
+|---|---|---|
+| A refresh, a reconnect or a second tab counted as a new visit — "Since your last visit" emptied before it was read | "New" now lasts until **Mark all as read**; updates older than two weeks drop off | Two sessions both show 1,560 new; mark read clears it for good |
+| Every reviewer got every dispute in the app (130 per person) | Disputes you're in stay yours; everyone else's are one Team activity line | Eric: 3 lines, not 130 cards |
+| No sign of other people's big activity | **Team activity**: one compact card, a line per person and area, Open Activity / Needs agreement / Dismiss all | "Jason · 1,500 change(s) in Department Review" |
+| Folds were per kind only; a folded list drew every row (484 sidebar buttons) | Fold by kind with who did it ("from Eric 3, Kristi 3, Jason 3"); opened fold shows newest 15 + "…and N more" + Open <tab> | Jason's 1,560: 2 cards, 70 buttons, 0.5 s per click |
+| Overridden group decisions said "1 of your staged item(s) replaced…" | "AJ (admin) overrode your GROCERY decision with DAIRY"; item overrides fold to "overrode N of your item decision(s)" | Notice text |
+| Undo requests stayed on a group after an admin override, landing on the admin | An override clears them | — |
+| Dismiss many was one round trip each | One statement | 1,460 dismissed in 0.8 s |
+| Row Open buttons squeezed to an empty box; stale Mine cards under Team while loading | Buttons on their own line | Screenshots |
+| **Pending Changes drew every staged group** (1,867 buttons, 29k page elements): 15 s to open, 4.4 s a click, and the browser stopped sending clicks (Push / Use this did nothing) | 25 groups a page in every list; ticks on other pages kept | 1,810 staged: 564 buttons, 2.5 s a click; untick on page 1 survives page 2 and back |
+| Push: one transaction per group | One transaction for all groups + batched activity lines, progress bar | 77,621 items pushed in ~20 s |
+| Team view lagged a minute after a push | Push clears the notification cache | — |
+
+Still to look at: opening Pending Changes the first time with thousands staged is ~10 s; a single vote on a card is ~1.2 s.
+
+## Personal notifications (2026-10-02, after the mass audit)
+
+Your call: nobody hears about work they never touched; admins hear about pushes (plus settings requests, app errors and a
+"waiting on a push" reminder); every note opens exactly where it's about. Built as notes written for the people involved at the
+moment each thing happens (dbo.user_notifications), plus the live "waiting on you" list. Click-through with the mass data:
+AJ's list = 9 settings requests + 1 reminder (+ one note per editor push); Jason's 1,500 pushed groups = one "Went live" card with a
+department breakdown; Eric got nothing about work he never touched; Open landed on the right card in Pending Changes (right page) and
+Decided, and on the push's report. Pending Changes keeps its cards: 25 a page per section, a one-line summary bar, a staged-by
+filter only on long multi-person lists, push summaries. New suite `ui_notifications` (20 checks). Full run: **38 suites,
+835 pass / 0 fail**; database back to #0 + the staged import.

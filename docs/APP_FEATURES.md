@@ -35,15 +35,18 @@ away; those are marked **(live at once)**. Department Review pushes by editors n
 | ID | Who | What you can do | What should happen |
 |---|---|---|---|
 | TB-01 | Editor+ | Click the bell (shows a count when there's something new) | Opens the sidebar with the notifications. Never hides or clears them. |
-| TB-02 | Editor+ | **Undo** (top bar) | Popup: undoes your last grid change (not staged yet) or your last Department Review action (vote, staged decision, override, Break Out / Send Back). Says what it will undo; **Confirm undo** / **Cancel**. Refuses (and says why) if someone changed that group since. Nothing to undo: says so. |
+| TB-02 | Editor+ | **Undo** (top bar) | Popup: undoes your last grid change (not staged yet) or your last Department Review action (vote, staged decision, override, Break Out / Send Back). Says what it will undo; **Confirm undo** / **Cancel**. One click that changed many groups (e.g. Approve all) is one step: "N groups, all from one click". Refuses (and says why) if someone changed that group since — for a many-group step, only those groups are left as they are. Nothing to undo: says so. |
 | TB-03 | Editor+ | **Redo** (top bar) | Same, the other way. |
-| NT-01 | Editor+ | Read "Waiting on you" and "Since your last visit" | Lists what needs you and what changed on your work; "New" badges since your last visit. 3+ of one kind fold into one card ("Show them"). |
-| NT-02 | Editor+ | **Open** on a notification | Jumps to Department Review on the right section, searched to that group. |
-| NT-03 | Editor+ | **✕** on one notification | That one is dismissed for you only, for good. |
-| NT-04 | Editor+ | **Dismiss these N** on a folded card | All of them dismissed. |
-| NT-05 | Editor+ | **Mark all as read** | "New" badges go; nothing is dismissed. |
-| NT-06 | Editor+ | Search / filter by type (shown with 8+ notifications) | Narrows the list. |
-| NT-07 | Admin | **Mine / Team** switch | Team: each other person's notifications, read-only (Open only). |
+| NT-01 | Editor+ | Read **Waiting on you** | Only your own: suggestions on items you staged, undo requests only you can act on, disputes you voted in. Stays until handled. 3+ of one kind fold into one card ("49 × Asked to undo · Kristi 40, Eric 9"); an opened card shows the newest 15. |
+| NT-01b | Editor+ | Read **What happened to your work** | Each written for you when it happened, only about work your account touched — never your own actions, never others' work you had no part in: it went live in someone else's push ("1,461 of your group decision(s): MEAT 103 · FROZEN 86 …"), an admin overrode or replaced it, a Merge discarded it, it was moved or undone by someone else, a new vote / agreement on a group you voted on, your claim lapsed or an admin released it, your suggestion was accepted or declined, your settings request was decided, your staged item edits were pushed. "While you were away" line when 10+ are new. |
+| NT-01c | Admin | Read **Waiting on you** + **Pushes** | Settings requests to decide, one "Staged, waiting on a push" reminder (how much, how old), app errors, and one note per push someone else made (opens its report). Your own pushes: no note (they're in the report). |
+| NT-02 | Editor+ | **Open** on a notification | Straight to it: the group's card wherever it is now (Crosswalk / Unmatched / Broken Out / the right page of Pending Changes / Decided), scrolled to and outlined; a push's report (Upload Reports → Pushes); Settings. The old tab clears at once ("Opening…"). |
+| NT-03 | Editor+ | **Dismiss** on one notification | Gone for you, for good. |
+| NT-04 | Editor+ | **Dismiss these N** on a folded card | All of them at once. |
+| NT-05 | Editor+ | **Mark all as read** | New marks go; a refresh or second tab never clears them on its own. |
+| NT-06 | Editor+ | Search (shown with 8+ notifications) | By group, person or what happened. |
+| NT-07 | Admin | **Mine / Team** switch | Team: each editor's notifications (Open works; no Dismiss) — to see what's waiting on them. |
+| UR-11 | Editor+ | Upload Reports → **Pushes** | Every recent push (Department Review and Item Master): who, when, groups / items, by department, by who staged them, the groups (pick one → Open it). |
 | NT-08 | Admin | App errors (top of sidebar): **Full details**, **Mark fixed**, **Mark all N fixed** | Shows errors people hit (who, where, details); marking fixed removes them. |
 
 ## 3. Item Master tab (IM)
@@ -55,7 +58,7 @@ away; those are marked **(live at once)**. Department Review pushes by editors n
 | IM-03 | Anyone | **Only manually-edited items** (+ **Edited by**) | Shows only items someone edited by hand, optionally by one person. |
 | IM-04 | Anyone | Rows per page, Page | "N matching items (T total) — page X of Y". |
 | IM-05 | Viewer/Editor | Look at the grid | Read-only ("Read only for your role."). |
-| IM-06 | Admin | Edit cells (Description, Department, Category, Subcategory, Brand, Pack, Size, UOM, Source) | "N edited row(s) — not staged yet"; edits survive filter/page changes. |
+| IM-06 | Admin | Edit cells (Description, Department, Category, Subcategory, Brand, Pack, Size, UOM, Source) | "N edited row(s) — not staged yet"; edits survive filter/page changes. An item with no department shows "(no department)"; picking it on an item that has one is refused ("Every item needs a department"). |
 | IM-07 | Admin | **Stage Changes** | Staged as item edits on Pending Changes. An item already corrected by hand asks first (**Stage this over the existing correction** / **Discard this edit, keep the correction**). An item with someone's change already waiting is refused with who/what. |
 | IM-08 | Admin | **Discard** | Drops the unstaged edits. |
 | IM-09 | Anyone | "Raw data has changed … since the last Merge" banner (+ **Go to Merge** for admins) | Shown when a source's file changed and hasn't been merged. |
@@ -82,7 +85,7 @@ Out, Pending Changes, Decided, Settings**. Every section has the same filter bar
 | ID | Who | What you can do | What should happen |
 |---|---|---|---|
 | DR-Q01 | Editor+ | Pick a Department and **Approve** | Card leaves the list; "Staged: … → DEPT (N item(s))". Goes to Pending Changes. Someone else suggested a different one: goes to Needs agreement. No Department picked: "Pick a Department first." |
-| DR-Q02 | Editor+ | **Approve all N on this page as suggested…** | Popover with counts; **Approve these N** stages each with its suggestion. |
+| DR-Q02 | Editor+ | **Approve all N on this page as suggested…** | Popover with counts; **Approve these N** stages each with its suggestion, all at once (a second or two). The top-bar Undo takes all of them back; each card's **↩ Undo…** takes back one. |
 | DR-Q03 | Editor+ | **Break Out** | Popup: how many items can be auto-matched now; **Apply auto-decisions** / **Start blank** / **Cancel**. Moves the group to Broken Out at once (undoable). |
 | DR-Q04 | Editor+ | **↩ Undo…** on a card (when it has something to undo) | Undo picker (see 4.8). |
 | DR-Q05 | Editor+ | Read the evidence line | e.g. "76% of 17 matched item(s) say GROCERY", "No evidence — pick a Department", "saved default: X". |
@@ -107,17 +110,17 @@ Out, Pending Changes, Decided, Settings**. Every section has the same filter bar
 | ID | Who | What you can do | What should happen |
 |---|---|---|---|
 | DR-PC01 | Editor+ | Search pending changes | Narrows every list below. |
-| DR-PC02 | Editor+ | **Include** tick on a group / Broken Out group | Unticked: moves to "Saved for later" (kept, not pushed). |
+| DR-PC02 | Editor+ | **Include** tick on a group / Broken Out group | Unticked: moves to "Saved for later" (kept, not pushed). Every list on Pending Changes shows 25 groups a page (‹ Previous · "26–50 of 1,810" · Next ›); ticks on other pages are kept. |
 | DR-PC03 | Editor+ | **Include all N** / **Leave all out** | Ticks/unticks every regular (non-import) change. |
 | DR-PC04 | Editor+ | **I also agree — DEPT** | Records your agreement (counts toward approvals). |
 | DR-PC05 | Editor+ (who staged it) | **Change Department** + **Update** | Restages with the new Department; approvals reset. |
 | DR-PC06 | Editor+ (someone else's) | **Suggest Department** + **Suggest** | Your vote; sends it to Needs agreement. Max 5 different suggestions. |
 | DR-PC07 | Editor+ | Needs agreement: **I also think this** / **Change vote** / **Withdraw my vote** / **Add suggestion** / **Save for later** | Settled when everyone agrees (or an admin overrides). |
-| DR-PC08 | Editor+ | Broken Out group: **Change items (N)** grid + **Apply changes** | Your own items change; others' become suggestions to their owner. |
+| DR-PC08 | Editor+ | Broken Out group: **Change items (N)** grid + **Apply changes** | Your own items change; others' become suggestions to their owner. An admin's change replaces the owner's (owner gets a notice; top-bar Undo puts theirs back). |
 | DR-PC09 | Owner / admin | Item suggestions: **Accept / Deny** (all, per item, or picked); suggester: **Withdraw** | Applies or drops the suggested Department. |
 | DR-PC10 | Admin | **🛡️ Override** on a group | Popup: force any Department and lock it (**Override**, **Update override**, **Remove override (unlock)**). For a Broken Out group: per-item **Override to** / **Unlock**, or whole group at once. |
 | DR-PC11 | Editor | **Approve this batch** | Adds your approval ("Approved by … (k of 2 needed)"). |
-| DR-PC12 | Editor+ (2 approvals) / Admin | Tick **I've reviewed these changes…** then **Push N Included Item(s)** | Tick is instant. Push makes the included decisions live and updates those items' Department in the item master (only those items). "Pushed N item(s). Item Master updated — M item department(s) changed." Nothing included: says so. Push blocked while a "Needs your choice" question is open. Push without the tick: "Tick … first". |
+| DR-PC12 | Editor+ (2 approvals) / Admin | Tick **I've reviewed these changes…** then **Push N Included Item(s)** | Tick is instant. Push (with a progress bar; ~20 s for 1,500 groups + 3,000 items) makes the included decisions live and updates those items' Department in the item master (only those items). "Pushed N item(s). Item Master updated — M item department(s) changed." Nothing included: says so. Push blocked while a "Needs your choice" question is open. Push without the tick: "Tick … first". |
 | DR-PC13 | Editor+ | Recent moves: **↩ Undo…** | Undo a Break Out / Send Back, back to any earlier step. |
 | DR-PC14 | Stager / admin | UPC overrides staged for items in these groups: **↩ Undo…** → **Remove them** | Takes back those staged overrides. |
 | DR-PC15 | Stager / admin | Undo requested: **↩ Undo…** | Undo something others asked to be undone. |
@@ -193,7 +196,7 @@ Out, Pending Changes, Decided, Settings**. Every section has the same filter bar
 | UR-02 | Editor+ | New items: **Open group →** shortcuts (not on the baseline) | Lists new items still needing a Department, by group; jumps to that exact group (outlined). Staged ones say "staged on Pending Changes". Items that joined a decided group or were auto-matched aren't listed. |
 | UR-03 | Editor+ | New items: filter, tick, **Stage deleting** | Staged deletes (only items already in the item master). |
 | UR-04 | Editor+ | Not in the file: tick, **Stage removing** | Staged removals; "Still in another source's file" listed separately, can't be removed. |
-| UR-05 | Editor+ | Possible duplicate UPCs: filter, pages (‹ › / Previous / Next), open a pair, **What the files say**, **Keep this one** | Staged combine (the other is removed and stays out). |
+| UR-05 | Editor+ | Possible duplicate UPCs: filter, pages (‹ › / Previous / Next), open a pair, **What the files say**, **Keep this one** | Staged combine (the other is removed and stays out). Each Upload Reports tab starts with a live count ("N possible duplicate pairs to review", "N items with a made-up UPC · M staged to delete", "N items no current file has") — tab names stay plain so the open tab never resets. |
 | UR-06 | Editor+ | **Not the same item** **(live at once)** | Pair taken off the list for good; listed under "Marked as two different items" → **Put back on the list**. |
 | UR-07 | Editor+ | **Combined · N** → tick + **Undo combine** **(live at once)** | The removed item comes back as it was. |
 | UR-08 | Editor+ | Placeholder UPCs: tick + **Stage deleting** | Made-up codes (99999…), staged deletes. |
@@ -265,7 +268,7 @@ Out, Pending Changes, Decided, Settings**. Every section has the same filter bar
 | ID | Who | What you can do | What should happen |
 |---|---|---|---|
 | AC-01 | Editor+ | Filters: Period, People, Areas, Search, How | Narrows everything below. |
-| AC-02 | Editor+ | Metrics + **Download these N change(s) as CSV** | Counts; CSV of the filtered changes. |
+| AC-02 | Editor+ | Metrics + **Download these N change(s) as CSV** | Counts ("Groups touched" = the rows in By group); CSV of the filtered changes. |
 | AC-03 | Editor+ | By person (+ one person day by day), By group (find, Now in), By day (per person), Every line (pages), Staged now | Read-only views of who did what. |
 
 ## 15. Rules that cut across tabs (XR)

@@ -89,6 +89,11 @@ def grid_edited(key: str) -> bool:
     return bool(st_.get("edited_rows") or st_.get("added_rows") or st_.get("deleted_rows"))
 
 
+# Shown (and offered first) in the Item Master grid for an item that came in
+# without a department, so it's easy to spot; it can't be picked to clear one.
+NO_DEPARTMENT = "(no department)"
+
+
 def blank_text(df: pd.DataFrame) -> pd.DataFrame:
     """A table for showing: missing values in its text columns as blank cells
     (the grid would otherwise print the word "None"). Number and date columns
@@ -276,10 +281,14 @@ if (!window._appCardTagger) {
   // runs (its own part of the page, then the whole page) — so the page is
   // marked as switching tabs until Department Review has been drawn: the old
   // tab's content goes at once, placeholder cards show, and the button says so.
+  // A notification's Open does the same (to whichever tab it's about).
   document.addEventListener("click", e => {
-    const b = e.target.closest('[class*="st-key-needs_dec_"] button');
+    let b = e.target.closest('[class*="st-key-needs_dec_"] button');
+    const note = !b && e.target.closest('[class*="st-key-notif_"] button');
+    if (note && /^Open/.test(note.innerText.trim())) b = note;
     if (!b || b.disabled) return;
     const lbl = b.querySelector("p") || b;
+    const was = lbl.textContent;
     lbl.textContent = "Opening…";
     const body = document.body;
     const t0 = Date.now();
@@ -287,14 +296,16 @@ if (!window._appCardTagger) {
       body.dataset.tabSwitch = "main";
       body.dataset.tabPhase = "wait";
       window.scrollTo({top: 0});
-      let idle = 0;
+      let idle = 0, seen = false;
       const watch = setInterval(() => {
         const app = document.querySelector("[data-test-script-state]");
         const running = app && app.getAttribute("data-test-script-state") === "running";
-        const there = new URL(window.location.href).searchParams.get("tab") === "Department Review";
+        seen = seen || running;  // (a notification: done once its run has started and finished)
+        const there = note ? seen : new URL(window.location.href).searchParams.get("tab") === "Department Review";
         idle = there && !running ? idle + 1 : 0;
         if (idle >= 3 || Date.now() - t0 > 25000) {
           delete body.dataset.tabSwitch; delete body.dataset.tabPhase; clearInterval(watch);
+          if (lbl.isConnected && lbl.textContent === "Opening…") lbl.textContent = was;  // (a button that stays on the page)
         }
       }, 50);
     }, 0);
@@ -1881,7 +1892,7 @@ def render_upc_change_suggestions(suggestions_by_upc: dict, pending_upc_changes:
     def _deny(upc, suggested_by):
         verb = "Withdrew your suggestion" if suggested_by == actor else f"Denied {suggested_by}'s suggestion"
         with track(combo_id, grp_label, verb):
-            dept_mapping.deny_upc_suggestion(ENGINE, upc, suggested_by)
+            dept_mapping.deny_upc_suggestion(ENGINE, upc, suggested_by, actor=actor)
 
     for (owner, suggested_by, department), items in groups.items():
         can_act = is_admin or actor == owner
@@ -3292,6 +3303,21 @@ def render_item_master_pending_section() -> dict:
                     dept_mapping.delete_item_master_pending(ENGINE, upc)
                 st.session_state.pop(f"im_pending_include_{upc}", None)
         pushed_count = len(included_upcs)
+        push_id = uuid.uuid4().hex[:12]
+        by_type = Counter(pending[u]["change_type"] for u in included_upcs)
+        by_stager = Counter(pending[u].get("staged_by") or "?" for u in included_upcs)
+        dept_mapping.log_activity_many(ENGINE, push_actor, [{
+            "area": "Pushed live", "target": "Push", "n_items": pushed_count,
+            "action": f"Pushed {pushed_count:,} item master change(s)",
+            "details": {"push": push_id, "kind": "items", "items": pushed_count, "by_type": dict(by_type),
+                        "by_stager": dict(by_stager.most_common()), "upcs": list(included_upcs)[:2000]}}])
+        with ENGINE.begin() as c_:
+            dept_mapping.notify_many(c_, [{
+                "username": who, "kind": "items", "actor": push_actor, "title": "Item Master",
+                "detail": f"{push_actor} pushed {n:,} of your staged item change(s) live",
+                "link": {"to": "push", "id": push_id}, "batch": push_id} for who, n in by_stager.items() if who != "?"])
+        tell_admins_about_push(push_actor, push_id, f"{push_actor} pushed {pushed_count:,} item master change(s)",
+                               ", ".join(f"{n:,} {t}" for t, n in by_type.items()))
         n_types = Counter(pending[u]["change_type"] for u in included_upcs if pending[u]["change_type"] != "edit")
         if n_types:
             activity("Pushed live", "Pushed " + ", ".join(f"{n:,} item {'add' if k == 'add' else 'delete'}(s)" for k, n in n_types.items()),
@@ -4691,6 +4717,10 @@ def _open_notification(tab: str, search: str) -> None:
     # selectors and search box can be set here directly. (A button inside a
     # part of the page that re-runs on its own asks for the whole page — see _dr_section.)
     st.session_state["_full_rerun"] = True
+    if tab == "Activity":  # (team activity: the Activity tab, filtered to that person)
+        st.session_state["active_tab"] = "Activity"
+        st.session_state["act_people"] = [search] if search else []
+        return
     st.session_state["active_tab"] = "Department Review"
     st.session_state["dept_review_subtab"] = tab
     st.query_params["sub"] = tab  # (the address follows: a reload stays here)
@@ -4701,7 +4731,60 @@ def _open_notification(tab: str, search: str) -> None:
         get_dept_tab_filters()[tab_key] = {"search": search}
 
 
-JUMP_TAB_KEYS = {"Crosswalk": "dept_review_review", "Unmatched": "dept_review_unmatched", "Broken Out": "broken_out"}
+JUMP_TAB_KEYS = {"Crosswalk": "dept_review_review", "Unmatched": "dept_review_unmatched", "Broken Out": "broken_out",
+                 "Decided": "decided"}
+PC_CARD_KEYS = ("card_pc_{c}", "card_pcu_{c}", "card_disp_{c}", "card_ureq_{c}", "card_ureqg_{c}")
+
+
+def _go(link: dict) -> None:
+    """A notification's Open: straight to the exact place — the group's card
+    wherever the group is by now (Crosswalk, Unmatched, Broken Out, Pending
+    Changes — on the right page — or Decided), a push's report, Settings, or
+    a tab. (A button callback: it runs before anything is drawn.)"""
+    link = link or {}
+    st.session_state["_full_rerun"] = True
+    to = link.get("to")
+    if to == "group":
+        _go_group(int(link["id"]))
+        st.query_params["tab"] = st.session_state.get("active_tab", "Department Review")
+    elif to == "push":
+        st.session_state["active_tab"] = "Upload Reports"
+        st.session_state["_ur_tab"] = "Pushes"
+        st.session_state["push_report_pick"] = link.get("id")
+    elif to in ("settings", "tab_dr"):
+        sub = "Settings" if to == "settings" else link.get("sub", "Pending Changes")
+        st.session_state["active_tab"] = "Department Review"
+        st.session_state["dept_review_subtab"] = sub
+        st.query_params["sub"] = sub
+        st.session_state["_dr_default"] = None
+    elif to == "tab":
+        st.session_state["active_tab"] = link.get("tab", "Item Master")
+
+
+def _go_group(cid: int) -> None:
+    staged = (cid in load_dept_pending_changes() or cid in load_combo_suggestions()
+              or any(c.get("combo_id") == cid for c in load_dept_pending_upc_changes().values()))
+    facts = load_group_facts().get(cid) or {}
+    label = f"{(facts.get('source_key') or '').upper()} — " if facts else ""
+    if staged:
+        st.session_state["active_tab"] = "Department Review"
+        st.session_state["dept_review_subtab"] = "Pending Changes"
+        st.query_params["sub"] = "Pending Changes"
+        st.session_state["_dr_default"] = None
+        get_shared_dept_filter()["search"] = ""
+        get_dept_tab_filters()["pending_changes"] = {"search": ""}
+        for k in ("pc_by_ready", "pc_by_later"):
+            st.session_state.pop(k, None)
+        st.session_state["_pc_jump"] = cid
+        return
+    where = facts.get("where") or "Decided"
+    st.session_state["active_tab"] = "Department Review"
+    _jump_to_group(where, cid, label)
+
+
+def _outline_any(keys) -> None:
+    """_outline_card for whichever of these cards is on the page."""
+    _outline_card(", .st-key-".join(keys))
 
 
 def _jump_to_group(section: str, combo_id: int, label: str) -> None:
@@ -4859,15 +4942,27 @@ def render_app_errors() -> None:
     st.divider()
 
 
-NOTIF_ICONS = {}
-NOTIF_ROLLUP = 3  # this many of one kind in a list fold into one card
+def top_counts(counts: dict, n: int = 4) -> str:
+    """"GROCERY 610 · FROZEN 280 · DAIRY 190 · +5 more"."""
+    items = sorted((counts or {}).items(), key=lambda kv: -kv[1])
+    out = " · ".join(f"{k} {v:,}" for k, v in items[:n])
+    return out + (f" · +{len(items) - n} more" if len(items) > n else "")
+
+
+NOTIF_ROLLUP = 3      # this many of one kind from one person fold into one card
+NOTIF_ROWS_SHOWN = 15  # rows drawn when a folded card is opened ("…and N more" after)
+# how a folded card names the person: "40 × Undo requests from Kristi", "120 × Pushed live by AJ"
+NOTIF_WHO_WORD = {"suggestion": "from", "undo": "from", "request": "from", "discarded": "by", "pushed": "by",
+                  "moved": "by"}
 
 
 def render_notifications_sidebar() -> None:
-    """What's waiting on you, and what changed on your work since your last
-    visit — in the sidebar, out of the way of the page itself. Three or more
-    of one kind fold into one card, so a big push or import is one line,
-    not fifty. Admins can also see everyone else's, one person at a time."""
+    """Your notifications — only about work your account touched — in the
+    sidebar. "Waiting on you" stays until it's handled; "What happened to
+    your work" is each thing someone else did to it. Many of one kind fold
+    into one card (newest 15 one click away). Every one has Open, which goes
+    straight to the card it's about. Admins: pushes, settings requests, app
+    errors, and a Team view of each editor's notifications."""
     name = st.session_state["name"]
     since = _notif_since()
     notes = _without_dismissed(load_notifications(name, since, is_admin))
@@ -4876,103 +4971,119 @@ def render_notifications_sidebar() -> None:
 
     def _row(n, key, mine=True):
         badge = ":blue[New] · " if n["new"] else ""
-        c1, c2, c3 = st.columns([4, 1.3, 0.55] if mine else [4, 1.3, 0.01], vertical_alignment="center")
-        c1.markdown(f"{badge}**{n['title']}**  \n:gray[{n['detail']}]")
-        c2.button("Open", key=key, width='stretch', help=f"Open it on {n['tab']}",
-                  on_click=_open_notification, args=(n["tab"], n["search"]))
+        when = local_time(n["when"], "%b %d %I:%M %p") if n.get("when") is not None else ""
+        st.markdown(f"{badge}**{n['title']}**  \n:gray[{n['detail']}" + (f" · {when}" if when else "") + "]")
+        bar = st.container(horizontal=True, gap="small")
+        if n.get("link"):
+            bar.button("Open", key=key, help="Go straight to it", on_click=_go, args=(n["link"],))
         if mine:
-            c3.button("✕", key=f"{key}_x", width='stretch', help="Dismiss — don't show this one again",
-                      on_click=_dismiss_notes, args=([n],), type="tertiary")
+            bar.button("Dismiss", key=f"{key}_x", help="Don't show this one again", type="tertiary",
+                       on_click=_dismiss_notes, args=([n],))
 
-    def _card(n, key):
-        with st.container(border=True):
-            _row(n, key, mine=not key.startswith("notif_team_"))
-
-    def _rollup(kind, items, key):
+    def _rollup(kind, items, key, mine):
         n_new_here = sum(1 for n in items if n["new"])
+        people = Counter(n.get("who") for n in items if n.get("who"))
+        by = (f" · from **{next(iter(people))}**" if len(people) == 1 else
+              " · " + ", ".join(f"**{p}** {c:,}" for p, c in people.most_common(3)) + (" …" if len(people) > 3 else "")
+              if people else "")
         with st.container(border=True):
-            st.markdown(f"**{len(items)} × {kinds.get(kind, kind)}**"
-                        + (f" · {n_new_here} new" if n_new_here else ""))
-            st.caption(items[0]["detail"] + (" · and more" if len(items) > 1 else ""))
-            with st.expander("Show them"):
-                for i, n in enumerate(items):
-                    _row(n, f"{key}_{i}", mine=not key.startswith("notif_team_"))
-            if not key.startswith("notif_team_"):
-                st.button(f"Dismiss these {len(items)}", key=f"{key}_x", type="tertiary",
+            st.markdown(f"**{len(items):,} × {kinds.get(kind, kind)}**{by}" + (f" · {n_new_here:,} new" if n_new_here else ""))
+            if kind == "pushed":
+                depts = Counter(m.group(1) or m.group(2) for n in items
+                                for m in [re.search(r"\(([^)]+)\) live|live as (.+)$", n["detail"] or "")] if m)
+                n_items_ = sum(int(m.group(1).replace(",", "")) for n in items
+                               for m in [re.search(r"pushed ([\d,]+) of your item", n["detail"] or "")] if m)
+                bits = [f"{sum(depts.values()):,} of your group decision(s): {top_counts(dict(depts), 3)}" if depts else "",
+                        f"{n_items_:,} of your item decision(s)" if n_items_ else ""]
+                st.caption(" · ".join(b for b in bits if b) or items[0]["detail"])
+            else:
+                st.caption(items[0]["detail"])
+            with st.expander(f"Show the newest {min(len(items), NOTIF_ROWS_SHOWN)}"):
+                for i, n in enumerate(items[:NOTIF_ROWS_SHOWN]):
+                    _row(n, f"{key}_{i}", mine)
+                if len(items) > NOTIF_ROWS_SHOWN:
+                    st.caption(f"…and {len(items) - NOTIF_ROWS_SHOWN:,} more.")
+            if mine:
+                st.button(f"Dismiss these {len(items):,}", key=f"{key}_x", type="tertiary",
                           on_click=_dismiss_notes, args=(items,))
 
-    def _section(title, items, empty, key):
-        st.markdown(f"**{title}**" + (f" ({len(items)})" if items else ""))
+    def _section(title, items, empty, key, mine=True):
+        st.markdown(f"**{title}**" + (f" ({len(items):,})" if items else ""))
         if not items:
             st.caption(empty)
             return
-        by_kind = {}
-        for n in items:
-            by_kind.setdefault(n.get("kind"), []).append(n)
+        groups = {}
+        for n in items:  # newest first; a fold sits where its newest one is
+            groups.setdefault(n.get("kind"), []).append(n)
         shown = set()
-        for i, n in enumerate(items):  # newest first; a kind folds where its newest one is
-            k = n.get("kind")
-            if k in shown:
+        for i, n in enumerate(items):
+            g = n.get("kind")
+            if g in shown:
                 continue
-            if len(by_kind[k]) >= NOTIF_ROLLUP:
-                _rollup(k, by_kind[k], f"notif_{key}_{k}")
-                shown.add(k)
+            shown.add(g)
+            if len(groups[g]) >= NOTIF_ROLLUP:
+                _rollup(g, groups[g], f"notif_{key}_{g}", mine)
             else:
-                _card(n, f"notif_{key}_{i}")
+                for j, m in enumerate(groups[g]):
+                    with st.container(border=True):
+                        _row(m, f"notif_{key}_{i}_{j}", mine)
 
-    def _filter(items, q, kind):
-        if kind != "All types":
-            items = [n for n in items if kinds.get(n.get("kind")) == kind]
+    def _away(updates):
+        """One line when a lot happened while you were away."""
+        unread = Counter(n["kind"] for n in updates if n["new"])
+        if sum(unread.values()) < 10:
+            return
+        st.caption("While you were away: " + " · ".join(f"**{c:,}** {kinds.get(k, k).lower()}" for k, c in unread.most_common()))
+
+    def _filter(items, q):
         if q:
-            items = [n for n in items if q in n["title"].lower() or q in n["detail"].lower()]
+            items = [n for n in items if q in (n["title"] or "").lower() or q in (n["detail"] or "").lower()
+                     or q in (n.get("who") or "").lower()]
         return items
 
     with st.sidebar:
-        st.markdown("### Notifications" + (f" · {n_new} new" if n_new else ""))
+        st.markdown("### Notifications" + (f" · {n_new:,} new" if n_new else ""))
         if is_admin:
             render_app_errors()
         view = "Mine"
         if is_admin:
             view = st.segmented_control(
                 "Whose", ["Mine", "Team"], default="Mine", key="notif_view", label_visibility="collapsed",
-                help="Team: what's waiting on each other reviewer, one person at a time.",
+                help="Team: each editor's notifications, so you can see what's waiting on them.",
             ) or "Mine"
-        q, kind = "", "All types"
+        q = ""
         if view == "Team" or len(notes["action"]) + len(notes["updates"]) > 8:
-            q = st.text_input(
-                "Search notifications", key="notif_search", placeholder="Search — group, person, or what happened",
-                label_visibility="collapsed",
-            ).strip().lower()
-            kind = st.selectbox("Type", ["All types"] + list(kinds.values()), key="notif_kind", label_visibility="collapsed")
+            q = st.text_input("Search notifications", key="notif_search", placeholder="Search — group, person, or what happened",
+                              label_visibility="collapsed").strip().lower()
 
         if view == "Mine":
-            action, updates = _filter(notes["action"], q, kind), _filter(notes["updates"], q, kind)
-            filtered = (q or kind != "All types")
-            _section("Waiting on you", action, "Nothing matches." if filtered else "Nothing is waiting on you.", "action")
+            action, updates = _filter(notes["action"], q), _filter(notes["updates"], q)
+            if not q:
+                _away(notes["updates"])
+            _section("Waiting on you", action, "Nothing matches." if q else "Nothing is waiting on you.", "action")
             st.divider()
-            _section("Since your last visit", updates, "Nothing matches." if filtered else "Nothing new.", "updates")
+            _section("Pushes" if is_admin else "What happened to your work", updates,
+                     "Nothing matches." if q else "Nothing new.", "updates")
             if n_new:
                 st.button("Mark all as read", key="notif_mark_read", width='stretch', on_click=_mark_all_read,
-                          help=f"Clears the marks (new since {pd.Timestamp(since).strftime('%m/%d %H:%M')} UTC)")
+                          help="Clears the New marks (what's waiting on you stays until it's handled).")
             return
 
-        others = [
-            v["name"] for v in auth_config["credentials"]["usernames"].values()
-            if v.get("role") in ("admin", "editor") and v["name"] != name
-        ]
-        for person in sorted(others):
+        editors = [v["name"] for v in auth_config["credentials"]["usernames"].values()
+                   if v.get("role") == "editor" and v["name"] != name]
+        for person in sorted(editors):
             pn = load_notifications(person, load_last_seen(person))
-            p_action, p_updates = _filter(pn["action"], q, kind), _filter(pn["updates"], q, kind)
+            p_action, p_updates = _filter(pn["action"], q), _filter(pn["updates"], q)
             p_new = sum(1 for n in p_action + p_updates if n["new"])
-            label = f"{person} · {len(p_action)} waiting" + (f" · {p_new} new" if p_new else "")
+            label = f"{person} · {len(p_action):,} waiting" + (f" · {p_new:,} new" if p_new else "")
             with st.expander(label):
                 if not (p_action or p_updates):
-                    st.caption("Nothing for them right now." if not q and kind == "All types" else "Nothing matches.")
+                    st.caption("Nothing for them right now." if not q else "Nothing matches.")
                 slug = re.sub(r"\W", "_", person)
                 if p_action:
-                    _section("Waiting on them", p_action, "", f"team_{slug}_action")
+                    _section("Waiting on them", p_action, "", f"team_{slug}_action", mine=False)
                 if p_updates:
-                    _section("Since their last visit", p_updates, "", f"team_{slug}_updates")
+                    _section("What happened to their work", p_updates, "", f"team_{slug}_updates", mine=False)
 
 
 # ===========================================================================
@@ -5057,12 +5168,19 @@ def topbar_step_dialog():
             _close()
         return
     when = pd.to_datetime(target["created_at"], errors="coerce")
+    n_groups = int(target.get("n_groups") or 1)
     st.markdown(f"**{'Undo' if undo else 'Redo'} your last {'change' if undo else 'undo'}?**")
-    st.markdown(f"**{target['description']}** — {target['label']}")
+    if n_groups > 1:
+        st.markdown(f"**{n_groups:,} groups, all from one click** — for example {target['label']}: "
+                    f"{target['description']}")
+    else:
+        st.markdown(f"**{target['description']}** — {target['label']}")
     if pd.notna(when):
-        st.caption(f"Made {when.strftime('%m/%d %H:%M')} UTC. "
-                   + ("Puts the group back exactly as it was before this." if undo
-                      else "Puts the group back exactly as this left it."))
+        st.caption(f"Made {local_time(when, '%m/%d %I:%M %p')}. "
+                   + (("Puts every one of these groups back exactly as it was before." if n_groups > 1 else
+                       "Puts the group back exactly as it was before this.") if undo
+                      else ("Puts every one of these groups back exactly as this left them." if n_groups > 1 else
+                            "Puts the group back exactly as this left it.")))
     c1, c2 = st.columns(2)
     if c1.button("Confirm undo" if undo else "Confirm redo", type="primary", width='stretch'):
         with st.spinner("Undoing..." if undo else "Redoing..."):
@@ -5079,7 +5197,14 @@ def topbar_step_dialog():
                 st.session_state[f"_grp_file_{f['stem']}"] = {k: f[k] for k in ("stem", "name", "bytes")}
             else:
                 st.session_state.pop(f"_grp_file_{f['stem']}", None)
-        if result["ok"]:
+        skipped = result.get("skipped") or []
+        if result["ok"] and (e.get("n_groups") or 1) > 1:
+            st.session_state["_toast"] = (
+                f"{'Undone' if undo else 'Redone'}: {e.get('n_done', 0):,} group(s) from one click"
+                + (f". {len(skipped):,} left as they are — changed since: "
+                   + "; ".join(f"**{lbl}** ({why})" for lbl, why in skipped[:3])
+                   + (" …" if len(skipped) > 3 else "") if skipped else "") + ".", "")
+        elif result["ok"]:
             st.session_state["_toast"] = (f"{'Undone' if undo else 'Redone'}: {e['description']} — **{e['label']}**.",
                                           "" if undo else "")
         else:
@@ -5105,14 +5230,20 @@ def _my_dismissed() -> set:
 
 def _without_dismissed(notes: dict) -> dict:
     gone = _my_dismissed()
-    return {k: ([n for n in v if dept_mapping.note_key(n) not in gone] if k in ("action", "updates") else v)
+    return {k: ([n for n in v if n.get("note_id") is not None or dept_mapping.note_key(n) not in gone]
+                if k in ("action", "updates", "team") else v)
             for k, v in notes.items()}
 
 
 def _dismiss_notes(items: list) -> None:
-    keys = [dept_mapping.note_key(n) for n in items]
-    dept_mapping.dismiss_notes(ENGINE, st.session_state["name"], keys)
-    _my_dismissed().update(keys)
+    ids = [n["note_id"] for n in items if n.get("note_id") is not None]
+    if ids:
+        dept_mapping.dismiss_note_ids(ENGINE, st.session_state["name"], ids)
+    keys = [dept_mapping.note_key(n) for n in items if n.get("note_id") is None]
+    if keys:
+        dept_mapping.dismiss_notes(ENGINE, st.session_state["name"], keys)
+        _my_dismissed().update(keys)
+    load_notifications.clear()
 
 
 def _on_logout(_info=None) -> None:
@@ -5291,6 +5422,41 @@ DEPT_PAGE_KEYS = {"Crosswalk": "dept_review_page_num_review", "Unmatched": "dept
                   "Broken Out": "broken_out_page_num", "Decided": "decided_page_num"}
 IM_PAGE_SIZES = [100, 250, 500, 1000, 2500, 5000]
 RECENT_MOVES_SHOWN = 5  # Pending Changes: newest moved groups shown at the top
+PC_PAGE_SIZE = 25       # Pending Changes: groups drawn per page in each list
+
+
+def _pc_set_page(key: str, page: int) -> None:
+    st.session_state[key] = page
+
+
+def pc_page(items: list, key: str, size: int = PC_PAGE_SIZE) -> list:
+    """The page of `items` to draw now, with ‹ Previous · "26–50 of 128" · Next ›
+    when there's more than one page. Hundreds of staged groups stay quick:
+    only one page of cards (and their buttons) is drawn at a time; ticks on
+    the other pages are kept (see render_dr_pending_changes)."""
+    items = list(items)
+    n_pages = max(1, -(-len(items) // size))
+    pk = f"pc_page_{key}"
+    jump = st.session_state.get("_pc_jump")
+    if jump is not None:  # (a notification's Open: the page that group is on)
+        for i, it in enumerate(items):
+            cid_ = it[1] if isinstance(it, tuple) and len(it) == 2 and it[0] in ("g", "u") else (
+                it[0] if isinstance(it, tuple) else it)
+            if cid_ == jump:
+                st.session_state[pk] = i // size
+                break
+    page = min(max(st.session_state.get(pk, 0), 0), n_pages - 1)
+    if n_pages > 1:
+        start = page * size
+        c1, c2, c3 = st.columns([1, 2.2, 1], vertical_alignment="center")
+        c1.button("‹ Previous", key=f"{pk}_prev", width="stretch", disabled=page == 0,
+                  on_click=_pc_set_page, args=(pk, page - 1))
+        c2.markdown(f"<div style='text-align:center;opacity:.75;font-size:.9rem'>{start + 1:,}–"
+                    f"{min(start + size, len(items)):,} of {len(items):,} · page {page + 1} of {n_pages}</div>",
+                    unsafe_allow_html=True)
+        c3.button("Next ›", key=f"{pk}_next", width="stretch", disabled=page >= n_pages - 1,
+                  on_click=_pc_set_page, args=(pk, page + 1))
+    return items[page * size:(page + 1) * size]
 IM_DEFAULT_PAGE_SIZE = 1000
 IM_GRID_HEIGHT = 760  # about 20 rows on screen at once; scroll the grid for the rest of the page
 IM_URL = {"im_dept": "im_dept", "im_brand": "im_brand", "im_source": "im_source", "im_q": "im_search",
@@ -5470,11 +5636,28 @@ def render_item_master_tab() -> None:
         editor_key = f"items_editor_{st.session_state.get('_im_editor_v', 0)}"
         store = st.session_state.setdefault("_im_edits", {})
         shown_upcs = st.session_state.get("_im_shown_upcs") or []
+        originals = df.set_index("UPC")
+        no_dept_refused = []
         for pos, cols in ((st.session_state.get(editor_key) or {}).get("edited_rows") or {}).items():
             pos = int(pos)
             if pos < len(shown_upcs):
-                store.setdefault(shown_upcs[pos], {}).update(cols)
-        originals = df.set_index("UPC")
+                upc, cols = shown_upcs[pos], dict(cols)
+                if cols.get("Department") == NO_DEPARTMENT:
+                    # Every item has a department: "(no department)" only marks the
+                    # few that came in without one — it can't be picked to clear one.
+                    had = originals.loc[upc, "Department"] if upc in originals.index else None
+                    if isinstance(had, str) and had.strip():
+                        no_dept_refused.append(upc)
+                        cols.pop("Department")
+                    else:
+                        cols["Department"] = ""
+                store.setdefault(upc, {}).update(cols)
+        if no_dept_refused:
+            st.session_state["_im_editor_v"] = st.session_state.get("_im_editor_v", 0) + 1
+            editor_key = f"items_editor_{st.session_state['_im_editor_v']}"  # (redrawn from your kept edits)
+            st.warning(f"Every item needs a department — {', '.join(no_dept_refused[:5])}"
+                       f"{' …' if len(no_dept_refused) > 5 else ''} kept {'its' if len(no_dept_refused) == 1 else 'their'} "
+                       "department. Pick a different one instead of “(no department)”.")
         for upc in [u for u in store if u not in originals.index]:
             del store[upc]  # (that item is gone, or has a pending change staged meanwhile)
 
@@ -5508,8 +5691,12 @@ def render_item_master_tab() -> None:
             for col, v in store[upc].items():
                 shown.loc[shown["UPC"] == upc, col] = v
         st.session_state["_im_shown_upcs"] = shown["UPC"].tolist()
+        grid = blank_text(shown)
+        if "Department" in grid.columns:
+            grid = grid.assign(Department=grid["Department"].map(
+                lambda v: v if isinstance(v, str) and v.strip() else NO_DEPARTMENT))
         st.data_editor(
-            blank_text(shown),
+            grid,
             key=editor_key,
             width='stretch',
             height=min(IM_GRID_HEIGHT, 38 + 35 * max(len(page_df), 1)),
@@ -5520,7 +5707,7 @@ def render_item_master_tab() -> None:
                 "Pack", "Size", "UOM", "SourceKey", "Manually Edited", "CreatedAt", "UpdatedAt",
             ],
             column_config={
-                "Department": st.column_config.SelectboxColumn(options=[""] + department_options, required=False),
+                "Department": st.column_config.SelectboxColumn(options=[NO_DEPARTMENT] + department_options, required=True),
             },
         )
         if page_df.empty:
@@ -5812,9 +5999,109 @@ def load_recent_pushes(limit: int = 10) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_pushes() -> list:
+    return dept_mapping.list_pushes(ENGINE, 5)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_push_groups(push_id: str) -> tuple:
+    return dept_mapping.list_push_groups(ENGINE, push_id, 25)
+
+
+def push_words(n_groups: int, n_items: int) -> str:
+    """"1,528 group decision(s) and 3,235 item decision(s)" — without a zero part."""
+    parts = ([f"{n_groups:,} group decision(s)"] if n_groups else []) + ([f"{n_items:,} item decision(s)"] if n_items else [])
+    return " and ".join(parts) or "nothing"
+
+
+def tell_admins_about_push(actor: str, push_id: str, title: str, detail: str) -> None:
+    """Each admin (not the one who pushed) gets a note that opens this push's report."""
+    admins = [v["name"] for v in auth_config["credentials"]["usernames"].values() if v.get("role") == "admin"]
+    with ENGINE.begin() as c_:
+        dept_mapping.notify(c_, admins, "push_report", actor, title, detail, link={"to": "push", "id": push_id}, batch=push_id)
+    load_notifications.clear()
+    load_pushes.clear()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_push_report(push_id: str) -> tuple:
+    return dept_mapping.list_push_groups(ENGINE, push_id, 5000)
+
+
+def render_push_reports() -> None:
+    """Upload Reports → Pushes: every recent push (Department Review and Item
+    Master) — who pushed what, which departments, whose work — and the groups
+    in it, each one click from its card."""
+    pushes = dept_mapping.list_pushes(ENGINE, 40)
+    if not pushes:
+        st.caption("No pushes recorded yet.")
+        return
+    ids = [p.get("push") for p in pushes]
+    want = st.session_state.pop("push_report_pick", None)
+    if want in ids:
+        st.session_state["push_report_sel"] = ids.index(want)
+
+    def label(i):
+        p = pushes[i]
+        what = (f"{p.get('items', 0):,} item master change(s)" if p.get("kind") == "items" else
+                push_words(p.get("groups", 0), p.get("items", 0)))
+        return f"{local_time(p['at'])} · {p['actor']} · {what}"
+    i = st.selectbox("Push", range(len(pushes)), key="push_report_sel", format_func=label, label_visibility="collapsed")
+    p = pushes[i]
+    if p.get("kind") == "items":
+        st.markdown(f"**{p['actor']}** pushed **{p.get('items', 0):,}** item master change(s) · {local_time(p['at'])}")
+        st.caption(" · ".join(f"{n:,} {t}" for t, n in (p.get("by_type") or {}).items())
+                   + (" — staged by " + top_counts(p.get("by_stager"), 4) if p.get("by_stager") else ""))
+        upcs = p.get("upcs") or []
+        if upcs:
+            st.dataframe(pd.DataFrame({"UPC": upcs}), hide_index=True, width="stretch", height=min(420, 38 + 35 * len(upcs)))
+        return
+    st.markdown(f"**{p['actor']}** pushed {push_words(p.get('groups', 0), p.get('items', 0))} · {local_time(p['at'])}")
+    c1, c2 = st.columns(2)
+    c1.caption("Group decisions by department: " + (top_counts(p.get("by_dept"), 8) or "—"))
+    c2.caption("Staged by: " + (top_counts(p.get("by_stager"), 6) or "—"))
+    rows, n_all = load_push_report(p["push"])
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    st.dataframe(df[["target", "action"]].rename(columns={"target": "Group", "action": "What"}), hide_index=True,
+                 width="stretch", height=min(420, 38 + 35 * len(df)))
+    pick = st.selectbox("Open a group", range(len(df)), index=None, key=f"push_open_{p['push']}",
+                        format_func=lambda j: df.iloc[j]["target"], placeholder="Open one of these groups…",
+                        label_visibility="collapsed")
+    if pick is not None and st.button("Open it", key=f"push_open_btn_{p['push']}", on_click=_go,
+                                      args=({"to": "group", "id": int(df.iloc[pick]["combo_id"])},)):
+        pass
+
+
 def render_recent_pushes() -> None:
-    """The last few groups pushed live — they've left Pending Changes for
-    Decided (a pushed decision is changed by sending it back, not undone)."""
+    """The last few pushes — one card each (how many groups and items, which
+    departments, whose work), with the groups one click away. Pushed groups
+    have left Pending Changes for Decided (changed by sending back, not undone)."""
+    pushes = load_pushes()
+    if pushes:
+        st.divider()
+        with st.expander(f"Recently pushed — the last {len(pushes)} push(es)", key="dr_recent_pushes"):
+            for i, p in enumerate(pushes):
+                when = local_time(p["at"])
+                with st.container(border=True):
+                    st.markdown(f"**{p['actor']}** pushed {push_words(p.get('groups', 0), p.get('items', 0))} · {when}")
+                    bits = [top_counts(p.get("by_dept"))]
+                    if p.get("by_stager"):
+                        bits.append("staged by " + top_counts(p["by_stager"], 3))
+                    st.caption(" — ".join(b for b in bits if b) or f"{p.get('item_count', 0):,} item(s)")
+                    if p.get("push") and st.toggle("Show the groups", key=f"push_groups_{p['push']}"):
+                        rows, n_all = load_push_groups(p["push"])
+                        for r in rows:
+                            c1, c2 = st.columns([4, 1.2], vertical_alignment="center")
+                            c1.markdown(f"{r['target']}  \n:gray[{r['action']}]")
+                            c2.button("Open in Decided", key=f"recent_push_{p['push']}_{int(r['combo_id'])}", width="stretch",
+                                      on_click=_open_notification, args=("Decided", (r["target"] or "").split(" — ", 1)[-1]))
+                        if n_all > len(rows):
+                            st.caption(f"…and {n_all - len(rows):,} more — all of them are on Decided, and on Activity.")
+        return
+    # (pushes made before the summaries were kept: the last few groups)
     df = load_recent_pushes()
     if df.empty:
         return
@@ -5831,8 +6118,14 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
     """Department Review → Pending Changes."""
     if st.session_state.pop("_reset_confirm_push", False):
         st.session_state["confirm_push_dept_changes"] = False
+    # Include / Save-for-later ticks: Streamlit forgets a tick whose card isn't
+    # drawn this run (it's on another page) — re-setting them keeps every one.
+    for k in [k for k in st.session_state if k.startswith(("dept_pending_include_combo_", "dept_pending_include_upc_group_",
+                                                           "dept_pending_snooze_"))]:
+        st.session_state[k] = st.session_state[k]
     render_discard_notices("dept_review")
     pc_search = render_search_bar("pending_changes", "Search Pending Changes", "Filter by source or group label…")
+    summary_slot = st.container()
 
     def _pc_matches(source_key, label):
         if not pc_search:
@@ -5876,7 +6169,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             _recent_move_card(combo_id, moves)
         if len(moved) > RECENT_MOVES_SHOWN:
             with st.expander(f"{len(moved) - RECENT_MOVES_SHOWN} older move(s)"):
-                for combo_id, moves in moved[RECENT_MOVES_SHOWN:]:
+                for combo_id, moves in pc_page(moved[RECENT_MOVES_SHOWN:], f"moves_{moved[0][0]}"):
                     _recent_move_card(combo_id, moves)
 
     def _group_text(combo_id):
@@ -5931,6 +6224,7 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
 
     # ---- Recent moves, at the top (the 5 most recent groups) ----
     if regular_moves:
+        _anchor("pc-moves")
         st.markdown("#### Recent moves")
         st.caption("Break Out / Send Back — already applied, no push needed. Undo… picks how far back to go.")
         _moves_list(regular_moves)
@@ -5980,11 +6274,11 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             ids = [cid for cid in group_ids if facts.get(cid, {}).get("where") == area]
             if ids:
                 st.markdown(f"##### {area} groups ({len(ids)})")
-                for cid in ids:
+                for cid in pc_page(ids, f"imp_{area}"):
                     render_group(cid)
         if upc_ids:
             st.markdown(f"##### Broken Out items ({len(upc_ids)} group(s))")
-            for cid in upc_ids:
+            for cid in pc_page(upc_ids, "imp_upc"):
                 render_upc(cid, "needs_agreement" if cid in needs else "ready")
         if not ov_import.empty:
             st.markdown(f"##### UPC overrides ({len(ov_import):,} item(s) in {ov_import['combo_id'].nunique()} group(s))")
@@ -6005,6 +6299,8 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
     needs_agreement_upc_combo_ids = []
     active_combo_disputes, snoozed_combo_disputes = {}, {}
     active_needs_agreement_upc_combo_ids, snoozed_needs_agreement_upc_combo_ids = [], []
+    included_combo_ids = excluded_combo_ids = included_upc_combo_ids = excluded_upc_combo_ids = []
+    reg = list
 
     if not total_pending_upcs:
         st.info("Nothing staged yet.")
@@ -6044,8 +6340,9 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         def _render_group_row(combo_id, change):
             with st.container(border=True, key=f"card_pc_{combo_id}"):
                 c0, c1, c_act = st.columns(CARD_COLS)
+                st.session_state.setdefault(f"dept_pending_include_combo_{combo_id}", True)
                 c0.checkbox(
-                    "Include", value=True, key=f"dept_pending_include_combo_{combo_id}",
+                    "Include", key=f"dept_pending_include_combo_{combo_id}",
                     label_visibility="collapsed",
                     help="Included in the next push — uncheck to save this one for later.",
                 )
@@ -6181,14 +6478,16 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             with st.container(border=True, key=f"card_pcu_{combo_id}"):
                 c0, c1, c_act = st.columns(CARD_COLS)
                 if mode == "ready":
+                    st.session_state.setdefault(f"dept_pending_include_upc_group_{combo_id}", True)
                     c0.checkbox(
-                        "Include", value=True, key=f"dept_pending_include_upc_group_{combo_id}",
+                        "Include", key=f"dept_pending_include_upc_group_{combo_id}",
                         label_visibility="collapsed",
                         help="Included in the next push — uncheck to save this whole group for later.",
                     )
                 else:
+                    st.session_state.setdefault(f"dept_pending_snooze_upc_group_{combo_id}", False)
                     c0.checkbox(
-                        "Save for later", value=False, key=f"dept_pending_snooze_upc_group_{combo_id}",
+                        "Save for later", key=f"dept_pending_snooze_upc_group_{combo_id}",
                         label_visibility="collapsed",
                         help="Move this group to Saved for later — it's still unresolved (still needs "
                              "agreement), just out of the main list until you check it again.",
@@ -6234,8 +6533,10 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                         }
                         for upc, change in items
                     ])
-                    st.caption("Fill in **New Department** for any row you want to change — your own items "
-                               "change directly, anyone else's becomes a suggestion for its owner.")
+                    st.caption("Fill in **New Department** for any row you want to change — "
+                               + ("as an admin, every item changes directly (its owner gets a notice; the top-bar "
+                                  "Undo puts theirs back)." if is_admin else
+                                  "your own items change directly, anyone else's becomes a suggestion for its owner."))
                     picked = render_item_workbench(
                         f"pc_{mode}_{combo_id}", display_df, pc_department_options, value_label="New Department",
                         title=f"{first.get('source_key', '').upper()} — {first['label']}",
@@ -6253,16 +6554,22 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                             for upc, dept in picked.items()
                         }
                         with track(combo_id, f"{first.get('source_key', '').upper()} — {first['label']}", f"Changed {len(decisions)} item(s) in the grid"):
-                            results = dept_mapping.stage_broken_out_decisions(ENGINE, decisions, actor, is_admin=is_admin)
+                            results = dept_mapping.stage_broken_out_decisions(ENGINE, decisions, actor, is_admin=is_admin,
+                                                                              admin_replaces=is_admin)
                         reset_item_workbench(f"pc_{mode}_{combo_id}")
                         clear_dept_suggestion_caches()
                         decided_n = sum(1 for r in results.values() if r["status"] == "decided")
+                        replaced = [r["owner"] for r in results.values() if r["status"] == "replaced"]
                         suggested_n = sum(1 for r in results.values() if r["status"] == "suggested")
                         blocked_n = sum(1 for r in results.values() if r["status"] == "blocked")
                         locked_n = sum(1 for r in results.values() if r["status"] == "locked")
                         msg_bits = []
                         if decided_n:
                             msg_bits.append(f"{decided_n} changed (you own them)")
+                        if replaced:
+                            who_ = sorted(set(replaced))
+                            msg_bits.append(f"{len(replaced)} staged by {', '.join(who_)} changed to yours "
+                                            f"({' and '.join(who_)} {'gets' if len(who_) == 1 else 'get'} a notice)")
                         if suggested_n:
                             msg_bits.append(f"{suggested_n} sent as suggestion(s) for the owner")
                         if blocked_n:
@@ -6351,18 +6658,20 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             included_pending_changes = {cid: pending_changes[cid] for cid in included_combo_ids}
             included_pending_upc_changes = {upc: pending_upc_changes[upc] for upc in included_upcs}
             touched_combo_ids = set(included_pending_changes.keys())
-            for combo_id, change in included_pending_changes.items():
-                dept_mapping.approve_combo(ENGINE, combo_id, change["department"], change.get("staged_by") or actor, pushed_by=actor,
-                                           note=change.get("origin_note"))
-                dept_mapping.delete_pending_change(ENGINE, combo_id)
+            push_progress = st.progress(0.05, text=f"Pushing {len(included_pending_changes):,} group decision(s)…")
+            push_id = uuid.uuid4().hex[:12]
+            # (one transaction for every group, however many — and a note for each person whose work went live)
+            dept_mapping.push_group_decisions(ENGINE, included_pending_changes, actor, push_id=push_id)
+            for combo_id in included_pending_changes:
                 st.session_state.pop(f"dept_pending_include_combo_{combo_id}", None)
+            push_progress.progress(0.45, text=f"Pushing {len(included_pending_upc_changes):,} item decision(s)…")
             if included_pending_upc_changes:
                 touched_combo_ids.update(c["combo_id"] for c in included_pending_upc_changes.values())
                 dept_mapping.apply_upc_decisions(
                     ENGINE,
                     {upc: {"department": c["department"], "staged_by": c.get("staged_by"), "origin_note": c.get("origin_note")}
                      for upc, c in included_pending_upc_changes.items()},
-                    actor,
+                    actor, push_id=push_id,
                 )
                 dept_mapping.delete_pending_upc_changes(ENGINE, list(included_pending_upc_changes))
                 for combo_id in included_upc_combo_ids:
@@ -6379,25 +6688,42 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             remaining_upc_combo_ids = {
                 c["combo_id"] for upc, c in pending_upc_changes.items() if upc not in included_pending_upc_changes
             }
-            for combo_id in touched_combo_ids - remaining_upc_combo_ids:
-                dept_mapping.clear_recent_moves_for_combo(ENGINE, combo_id)
+            dept_mapping.clear_recent_moves_for_combos(ENGINE, touched_combo_ids - remaining_upc_combo_ids)
             # Pushed is final: going back from here is a Send Back (itself
             # undoable), never a top-bar Undo of the push.
             dept_mapping.retire_undo_for_combos(ENGINE, touched_combo_ids)
             load_undo_redo.clear()
             load_recent_pushes.clear()
-            for combo_id, change in included_pending_changes.items():
-                activity("Pushed live", f"Pushed: {change['department']} (staged by {change.get('staged_by') or '?'})",
-                         f"{change['source_key'].upper()} — {change['label']}", change["n_upcs_total"], combo_id)
+            load_notifications.clear()  # (everyone's "pushed live" notes show at once, not a minute later)
+            load_pushes.clear()
+            push_progress.progress(0.7, text="Recording who pushed what…")
+            lines = [{"area": "Pushed live", "action": f"Pushed: {change['department']} (staged by {change.get('staged_by') or '?'})",
+                      "target": f"{change['source_key'].upper()} — {change['label']}", "n_items": change["n_upcs_total"],
+                      "combo_id": combo_id, "details": {"push": push_id}} for combo_id, change in included_pending_changes.items()]
             per_group = {}
             for upc, c in included_pending_upc_changes.items():
                 per_group.setdefault(c["combo_id"], []).append(c)
             for combo_id, items in per_group.items():
                 stagers = Counter(c.get("staged_by") or "?" for c in items)
-                activity("Pushed live", f"Pushed {len(items):,} item decision(s) (staged by "
-                         + ", ".join(f"{k} {n:,}" for k, n in stagers.items()) + ")",
-                         f"{(items[0].get('source_key') or '').upper()} — {items[0]['label']}", len(items), combo_id,
-                         details=dict(Counter(c["department"] for c in items)))
+                lines.append({"area": "Pushed live", "action": f"Pushed {len(items):,} item decision(s) (staged by "
+                              + ", ".join(f"{k} {n:,}" for k, n in stagers.items()) + ")",
+                              "target": f"{(items[0].get('source_key') or '').upper()} — {items[0]['label']}",
+                              "n_items": len(items), "combo_id": combo_id,
+                              "details": {"push": push_id, **Counter(c["department"] for c in items)}})
+            by_dept = Counter(c["department"] for c in included_pending_changes.values())
+            stagers = Counter(c.get("staged_by") or "?" for c in included_pending_changes.values())
+            stagers.update(c.get("staged_by") or "?" for c in included_pending_upc_changes.values())
+            lines.append({"area": "Pushed live", "target": "Push", "n_items": included_item_count,
+                          "action": f"Pushed {len(included_pending_changes):,} group decision(s) and "
+                                    f"{len(included_pending_upc_changes):,} item decision(s)",
+                          "details": {"push": push_id, "groups": len(included_pending_changes),
+                                      "items": len(included_pending_upc_changes), "item_count": included_item_count,
+                                      "by_dept": dict(by_dept.most_common()), "by_stager": dict(stagers.most_common())}})
+            dept_mapping.log_activity_many(ENGINE, actor, lines)
+            tell_admins_about_push(actor, push_id, f"{actor} pushed " + push_words(len(included_pending_changes),
+                                                                                    len(included_pending_upc_changes)),
+                                   top_counts(dict(by_dept), 3))
+            push_progress.progress(0.8, text="Updating Department in the item master…")
             pushed_count = included_item_count
             load_dept_pending_changes.clear()
             load_dept_pending_upc_changes.clear()
@@ -6410,11 +6736,11 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
             st.session_state["_reset_confirm_push"] = True
             # Carried straight into the item master's Department (and
             # any computed Merge draft) — no separate Merge needed.
-            with st.spinner("Updating Department in the item master..."):
-                # (only the pushed groups' items and the pushed items — nothing else changed)
-                synced = dept_mapping.sync_item_departments(
-                    ENGINE, set(dept_mapping.combo_member_upcs(ENGINE, included_pending_changes))
-                    | set(included_pending_upc_changes))
+            # (only the pushed groups' items and the pushed items — nothing else changed)
+            synced = dept_mapping.sync_item_departments(
+                ENGINE, set(dept_mapping.combo_member_upcs(ENGINE, included_pending_changes))
+                | set(included_pending_upc_changes))
+            push_progress.empty()
             clear_items_cache()
             st.session_state["_toast"] = (
                 f"Pushed {pushed_count:,} item(s). Item Master updated — {synced['items']:,} item "
@@ -6437,41 +6763,62 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
         active_needs_agreement_upc_combo_ids = reg(active_needs_agreement_upc_combo_ids)
         snoozed_needs_agreement_upc_combo_ids = reg(snoozed_needs_agreement_upc_combo_ids)
 
+        def _stager(kind_, cid):
+            if kind_ == "g":
+                return visible_pending_changes[cid].get("staged_by") or "?"
+            return Counter(c.get("staged_by") or "?" for _, c in visible_by_combo[cid]).most_common(1)[0][0]
+
+        def _include_key(kind_, cid):
+            return f"dept_pending_include_{'combo' if kind_ == 'g' else 'upc_group'}_{cid}"
+
+        def _set_all(rows, value):
+            for r in rows:
+                st.session_state[_include_key(*r)] = value
+
+        def _pc_list(entries, key, included):
+            """Ready to push / Saved for later: who staged them (pick one to see
+            only theirs), Include / Leave out for those, then a table past 25
+            (one row a group, Include ticks right in it) or cards, a page at a time."""
+            if not entries:
+                return
+            people = Counter(_stager(*e) for e in entries)
+            if len(people) > 1 and len(entries) > PC_PAGE_SIZE:
+                opts = ["Everyone"] + [p for p, _ in people.most_common()]
+                who = st.pills("Staged by", opts, key=f"pc_by_{key}", default="Everyone", label_visibility="collapsed",
+                               format_func=lambda o: f"{o} {len(entries) if o == 'Everyone' else people[o]:,}") or "Everyone"
+                if who != "Everyone":
+                    entries = [e for e in entries if _stager(*e) == who]
+            if len(entries) > 1:
+                b = st.container(horizontal=True, gap="small")
+                if included:
+                    b.button(f"Leave these {len(entries):,} out", key=f"pc_none_{key}", on_click=_set_all, args=(entries, False),
+                             help="Moves them to Saved for later (kept, not pushed).")
+                else:
+                    b.button(f"Include these {len(entries):,}", key=f"pc_all_{key}", on_click=_set_all, args=(entries, True))
+            for kind_, combo_id in pc_page(entries, key):
+                if kind_ == "g":
+                    _render_group_row(combo_id, visible_pending_changes[combo_id])
+                else:
+                    _render_upc_group_row(combo_id, visible_by_combo[combo_id])
+
         st.divider()
+        _anchor("pc-ready")
         st.markdown("#### Ready to push")
-        all_ids = reg(list(visible_pending_changes)) + reg(eligible_upc_combo_ids_all)
-        if len(all_ids) > 1:
-            b1, b2, _ = st.columns([1, 1, 2.5])
-            imp_note = "The old-workbook import's changes above have their own Include ticks."
-            if b1.button(f"Include these {len(all_ids)}", key="dept_pending_include_all", width="stretch", help=imp_note):
-                for cid in reg(list(visible_pending_changes)):
-                    st.session_state[f"dept_pending_include_combo_{cid}"] = True
-                for cid in reg(eligible_upc_combo_ids_all):
-                    st.session_state[f"dept_pending_include_upc_group_{cid}"] = True
-                dept_rerun()
-            if b2.button(f"Leave these {len(all_ids)} out", key="dept_pending_include_none", width="stretch", help=imp_note):
-                for cid in reg(list(visible_pending_changes)):
-                    st.session_state[f"dept_pending_include_combo_{cid}"] = False
-                for cid in reg(eligible_upc_combo_ids_all):
-                    st.session_state[f"dept_pending_include_upc_group_{cid}"] = False
-                dept_rerun()
         if not (reg(included_combo_ids) or reg(included_upc_combo_ids)):
             st.caption("Nothing currently included — check \"Include\" on a Saved for Later item below, or resolve a Needs Agreement one.")
         else:
-            st.caption("Uncheck to leave one out of the push. Suggesting a different Department sends it to Needs agreement.")
-            for combo_id in reg(included_combo_ids):
-                _render_group_row(combo_id, visible_pending_changes[combo_id])
-            for combo_id in reg(included_upc_combo_ids):
-                _render_upc_group_row(combo_id, visible_by_combo[combo_id])
+            st.caption("Untick to leave one out of the push (it moves to Saved for later). The old-workbook import above "
+                       "has its own ticks.")
+            _pc_list([("g", c) for c in reg(included_combo_ids)] + [("u", c) for c in reg(included_upc_combo_ids)],
+                     "ready", included=True)
 
-        if reg(excluded_combo_ids) or reg(excluded_upc_combo_ids) or snoozed_combo_disputes or snoozed_needs_agreement_upc_combo_ids:
+        later = [("g", c) for c in reg(excluded_combo_ids)] + [("u", c) for c in reg(excluded_upc_combo_ids)]
+        if later or snoozed_combo_disputes or snoozed_needs_agreement_upc_combo_ids:
             st.divider()
-            st.markdown("#### Saved for later")
+            _anchor("pc-later")
+            st.markdown(f"#### Saved for later ({len(later):,})" if later else "#### Saved for later")
             st.caption("Left out of the push — tick one to include it again.")
-            for combo_id in reg(excluded_combo_ids):
-                _render_group_row(combo_id, visible_pending_changes[combo_id])
-            for combo_id in reg(excluded_upc_combo_ids):
-                _render_upc_group_row(combo_id, visible_by_combo[combo_id])
+            _pc_list(later, "later", included=False)
             if snoozed_combo_disputes or snoozed_needs_agreement_upc_combo_ids:
                 st.caption(
                     "Still needs agreement (just moved out of the way below) — "
@@ -6485,13 +6832,19 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
     # ---- Needs agreement (bottom, per explicit layout request) ----
     if active_combo_disputes or active_needs_agreement_upc_combo_ids:
         st.divider()
-        st.markdown("#### Needs agreement")
+        _anchor("pc-agree")
+        n_agree = len(active_combo_disputes) + len(active_needs_agreement_upc_combo_ids)
+        st.markdown(f"#### Needs agreement ({n_agree:,})")
         st.caption("People suggested different Departments. It's settled when the ones who disagree change their "
                    "vote to match (or an admin overrides). Tick to save one for later.")
-        if active_combo_disputes:
-            render_combo_suggestion_disputes(active_combo_disputes)
-        for combo_id in active_needs_agreement_upc_combo_ids:
-            _render_upc_group_row(combo_id, visible_by_combo[combo_id], mode="needs_agreement")
+        page_ = pc_page([("g", c) for c in active_combo_disputes] + [("u", c) for c in active_needs_agreement_upc_combo_ids],
+                        "agree")
+        shown_disputes = {c: active_combo_disputes[c] for k_, c in page_ if k_ == "g"}
+        if shown_disputes:
+            render_combo_suggestion_disputes(shown_disputes)
+        for k_, combo_id in page_:
+            if k_ == "u":
+                _render_upc_group_row(combo_id, visible_by_combo[combo_id], mode="needs_agreement")
 
     # ---- Undo requested — a third bucket, separate from Ready to
     # push/Saved for later/Needs agreement, for anything with an
@@ -6501,8 +6854,12 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
     undo_requested_upc_groups = [cid for cid in visible_by_combo if upc_group_undo_requests.get(cid)]
     if undo_requested_combos or undo_requested_upc_groups:
         st.divider()
-        st.markdown("#### Undo requested")
+        _anchor("pc-ureq")
+        st.markdown(f"#### Undo requested ({len(undo_requested_combos) + len(undo_requested_upc_groups):,})")
         st.caption("Only the person who staged it (or an admin) can undo these.")
+        page_ = pc_page([("g", c) for c in undo_requested_combos] + [("u", c) for c in undo_requested_upc_groups], "ureq")
+        undo_requested_combos = [c for k_, c in page_ if k_ == "g"]
+        undo_requested_upc_groups = [c for k_, c in page_ if k_ == "u"]
         for combo_id in undo_requested_combos:
             change = visible_pending_changes[combo_id]
             requested = combo_undo_requests.get(combo_id, set())
@@ -6526,6 +6883,32 @@ def render_dr_pending_changes(pending_changes, pending_upc_changes, combo_sugges
                     if rc2.columns(2)[1].button("↩ Undo…", key=f"undo_requested_upc_group_{combo_id}", width='stretch', type="primary"):
                         open_undo_picker(combo_id, f"{first.get('source_key', '').upper()} — {first['label']}")
     render_recent_pushes()
+
+    jump = st.session_state.pop("_pc_jump", None)
+    if jump is not None:
+        _outline_any([k.format(c=jump) for k in PC_CARD_KEYS])
+
+    # ---- the summary bar at the top: how much is where, one click to each ----
+    bits = []
+    n_ready = len(reg(included_combo_ids)) + len(reg(included_upc_combo_ids))
+    n_later = len(reg(excluded_combo_ids)) + len(reg(excluded_upc_combo_ids))
+    n_agree = len(active_combo_disputes) + len(active_needs_agreement_upc_combo_ids)
+    n_ureq = len(undo_requested_combos) + len(undo_requested_upc_groups)
+    n_moves = len({m["combo_id"] for m in regular_moves})
+    for label, n, anchor in (("Ready to push", n_ready, "pc-ready"), ("Saved for later", n_later, "pc-later"),
+                             ("Needs agreement", n_agree, "pc-agree"), ("Undo requested", n_ureq, "pc-ureq"),
+                             ("Recent moves", n_moves, "pc-moves")):
+        if n:
+            bits.append(f"<a href='#{anchor}' style='text-decoration:none'><b>{n:,}</b> {label}</a>")
+    if bits:
+        summary_slot.markdown("<div style='display:flex;flex-wrap:wrap;gap:.4rem 1.1rem;padding:.55rem .8rem;"
+                              "border:1px solid rgba(128,128,128,.25);border-radius:.5rem;margin:.2rem 0 .6rem'>"
+                              + "".join(f"<span>{b}</span>" for b in bits) + "</div>", unsafe_allow_html=True)
+
+
+def _anchor(name: str) -> None:
+    """A spot the Pending Changes summary bar links to."""
+    st.markdown(f"<div id='{name}' style='scroll-margin-top:4rem'></div>", unsafe_allow_html=True)
 
 
 def render_dr_broken_out(pending_changes, pending_upc_changes, upc_change_suggestions) -> None:
@@ -6768,6 +7151,9 @@ def render_dr_decided(pending_changes, pending_upc_changes) -> None:
         filtered = sort_full_df(filtered, sort_column, sort_desc)
 
         page_num_key = "decided_page_num"
+        jump_cid = _jump_page("Decided", filtered, page_num_key, "decided")
+        if jump_cid is not None:
+            _outline_card(f"card_dec_{jump_cid}")
         n_whole = int(filtered["status"].str.startswith("Whole Group").sum())
         page_size, page_num, total_pages = render_page_controls(
             "decided", page_num_key, len(filtered),
@@ -7023,21 +7409,27 @@ def render_dr_review_queue(review_subtab, pending_changes, combo_suggestions) ->
             with st.popover(f"Approve all {len(suggested_rows)} on this page as suggested…"):
                 st.markdown(", ".join(f"**{d}** ×{n}" for d, n in suggested_rows["suggested_department"].value_counts().items()))
                 st.caption(f"{int(suggested_rows['n_upcs_total'].sum()):,} item(s). Each is staged on Pending Changes "
-                           "(nothing goes live until pushed) and has its own Undo….")
+                           "(nothing goes live until pushed). The top-bar Undo takes all of them back at once; each "
+                           "card's own Undo… takes back just that group.")
                 if st.button(f"Approve these {len(suggested_rows)}", key=f"approve_page_{tier}", type="primary"):
-                    n_disputed = 0
+                    batch = []
                     for _, r in suggested_rows.iterrows():
                         lbl = " / ".join(b for b in (r["raw_department"], r["raw_category"], r["raw_subcategory"]) if b) \
                             or "(blank Department/Category/Subcategory)"
-                        with track(int(r["combo_id"]), f"{r['source_key'].upper()} — {lbl}", f"Approved as {r['suggested_department']}"):
-                            res = dept_mapping.upsert_combo_suggestion(
-                                ENGINE, int(r["combo_id"]), tier, r["suggested_department"], r["source_key"], lbl,
-                                int(r["n_upcs_total"]), st.session_state["name"])
-                        n_disputed += bool(res.get("disputed"))
+                        batch.append({"combo_id": int(r["combo_id"]), "tier": tier, "department": r["suggested_department"],
+                                      "source_key": r["source_key"], "label": lbl, "label_full": f"{r['source_key'].upper()} — {lbl}",
+                                      "n_upcs_total": int(r["n_upcs_total"])})
+                    # one transaction for the whole page; one top-bar Undo takes all of it back
+                    res = dept_mapping.approve_suggestions_batch(ENGINE, batch, st.session_state["name"], CLICK_ID)
+                    load_undo_redo.clear()
                     clear_dept_suggestion_caches()
-                    st.session_state["_toast"] = (f"Staged {len(suggested_rows) - n_disputed} group(s) as suggested"
+                    n_ok, n_disputed, n_skip = len(res["staged"]), len(res["disputed"]), len(res["skipped"])
+                    st.session_state["_toast"] = (f"Staged {n_ok} group(s) as suggested"
                                                   + (f"; {n_disputed} went to Needs agreement" if n_disputed else "")
-                                                  + " — see Pending Changes.", "")
+                                                  + (f"; {n_skip} left as they are (an admin override or too many "
+                                                     "suggestions on them)" if n_skip else "")
+                                                  + " — see Pending Changes. The top-bar Undo takes them all back; "
+                                                    "each card's Undo… takes back just that one.", "")
                     dept_rerun()
 
         prefetch_affected_items(zip(page_df["combo_id"], page_df["n_upcs_total"]))
@@ -8760,6 +9152,7 @@ def render_duplicate_review() -> None:
     _frag_toast()
     view_all, n_staged = _open_dup_pairs()
     counts = view_all["Verdict"].value_counts().to_dict() if not view_all.empty else {}
+    st.markdown(f"**{len(view_all):,} possible duplicate pair{'' if len(view_all) == 1 else 's'} to review**")
     st.caption("Two UPCs with the same digits apart from one at the front — often a file that dropped a UPC's first "
                "digit (e.g. 1029100797 and 81029100797), sometimes two different products. Each is labelled with how "
                "alike the files say they are, most alike first; the label is only a hint. Open one to compare and decide.")
@@ -8854,8 +9247,12 @@ def render_placeholder_upcs() -> None:
     items = _items_by_upc(_items_fingerprint())
     ph = _placeholder_upcs(_items_fingerprint())
     if not ph:
+        st.markdown("**0 items with a made-up UPC**")
         st.caption("No item in the item master has a made-up UPC.")
         return
+    n_ph_staged = sum(1 for u_ in ph if u_ in load_item_master_pending())
+    st.markdown(f"**{len(ph):,} item{'' if len(ph) == 1 else 's'} with a made-up UPC**"
+                + (f" · {n_ph_staged:,} staged to delete" if n_ph_staged else ""))
     st.caption("Made-up codes like 9999999999 — files use them for items that have no real barcode (deli trays, in-store "
                "items), so several unrelated products can share one. The item master keeps only one item per UPC, so "
                "each of these holds whichever product came in first. They aren't duplicates: delete the ones you don't "
@@ -8926,6 +9323,9 @@ def render_stale_items() -> None:
     to clean out stale items whenever it's worth doing."""
     _frag_toast()
     gone = load_stale_seen(tuple(sorted(_upload_markers().items())))
+    n_gone_staged = int(gone["upc"].isin(set(load_item_master_pending())).sum()) if not gone.empty else 0
+    st.markdown(f"**{len(gone):,} item{'' if len(gone) == 1 else 's'} no current file has**"
+                + (f" · {n_gone_staged:,} staged to delete" if n_gone_staged else ""))
     if gone.empty:
         st.caption("Every item in the item master is in at least one source's current file (or was added by hand).")
         return
@@ -8958,12 +9358,16 @@ def render_upload_reports_tab() -> None:
     reports = load_upload_reports()
     current = upload_reports.current_report_ids(reports)
     labels = dict(zip(load_sources()["source_key"], load_sources()["source_label"]))
-    n_dup = len(_open_dup_pairs()[0])
-    n_ph = len(_placeholder_upcs(_items_fingerprint()))
-    n_stale = len(load_stale_seen(tuple(sorted(_upload_markers().items()))))
-    t_cur, t_dup, t_ph, t_stale, t_hist = st.tabs([
-        "Latest uploads", f"Possible duplicate UPCs ({n_dup:,})", f"Placeholder UPCs ({n_ph:,})",
-        f"No file has these ({n_stale:,})", "History"])
+    # Plain tab names: a name that changes resets which tab is open, so each
+    # tab's count is its first line instead (and updates the moment you act).
+    want = st.session_state.pop("_ur_tab", None)
+    if want:
+        st.session_state["_ur_nav"] = st.session_state.get("_ur_nav", 0) + 1
+    t_cur, t_dup, t_ph, t_stale, t_push, t_hist = st.tabs([
+        "Latest uploads", "Possible duplicate UPCs", "Placeholder UPCs", "No file has these", "Pushes", "History"],
+        key=f"ur_tabs_{st.session_state.get('_ur_nav', 0)}", **({"default": want} if want else {}))
+    with t_push:
+        render_push_reports()
     with t_cur:
         order = sorted(current.items(), key=lambda kv: -kv[1])
         rows = []
@@ -9877,11 +10281,13 @@ def render_activity_tab() -> None:
         _render_staged_now(staged)
         return
     v = _act_prepare(view)
+    by_group = _act_expand(v)  # (the By group list — "Groups touched" counts exactly its rows)
     pushed = v[v["area"] == "Pushed live"]
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Changes", f"{len(v):,}")
     m2.metric("People", f"{v['actor'].nunique():,}")
-    m3.metric("Groups touched", f"{v['target'].nunique():,}", help="Groups, items or sources changed")
+    m3.metric("Groups touched", f"{by_group['subject'].nunique():,}",
+              help="Groups and sources changed — an item change counts on the group its item is in (the By group list)")
     m4.metric("Items pushed live", f"{int(pushed['n'].sum()):,}")
     m5.metric("Staged now", f"{int(staged['n_changes'].sum()) if not staged.empty else 0:,}", help="Staged, not pushed yet")
 
@@ -9902,7 +10308,7 @@ def render_activity_tab() -> None:
         tbl.insert(0, "Staged now", staged.groupby("person")["n_changes"].sum().reindex(tbl.index).fillna(0).astype(int)
                    if not staged.empty else 0)
         tbl.insert(0, "Items pushed", pushed.groupby("actor")["n"].sum().reindex(tbl.index).fillna(0).astype(int))
-        tbl.insert(0, "Groups", v.groupby("actor")["target"].nunique())
+        tbl.insert(0, "Groups", by_group.groupby("actor")["subject"].nunique().reindex(tbl.index).fillna(0).astype(int))
         tbl.insert(0, "Changes", v.groupby("actor").size())
         tbl.insert(0, "Last active", v.groupby("actor")["when"].max().dt.strftime("%b %d %I:%M %p"))
         tbl = tbl.sort_values("Changes", ascending=False)
@@ -9915,7 +10321,7 @@ def render_activity_tab() -> None:
             _render_days(v[v["actor"] == who], key=f"act_pd_{who}", show_person=False)
 
     with t_groups:
-        _render_by_group(v, key="act_groups")
+        _render_by_group(v, key="act_groups", g=by_group)
 
     with t_days:
         _render_days(v, key="act_days")
@@ -9964,10 +10370,10 @@ def _render_days(v: pd.DataFrame, key: str, show_person: bool = True) -> None:
                     _day_table(gp, f"{key}_{day}_{person}_t")
 
 
-def _render_by_group(v: pd.DataFrame, key: str) -> None:
+def _render_by_group(v: pd.DataFrame, key: str, g: pd.DataFrame = None) -> None:
     """One row per group — item changes counted on the groups their items
     sit in — with the tab each group is on now."""
-    g = _act_expand(v)
+    g = _act_expand(v) if g is None else g
     if g.empty:
         st.caption("Nothing tied to a particular group or source.")
         return

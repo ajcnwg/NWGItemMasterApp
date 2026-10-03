@@ -290,6 +290,9 @@ body[data-tab-switch] [data-testid="stMainBlockContainer"]::after {
 /* Item Master's edit bar keeps one height whether it shows the hint or the
    Stage Changes / Discard buttons, so the grid doesn't jump on the first edit. */
 .st-key-im_edit_bar { min-height: 2.5rem; }
+/* The grid's hover toolbar floats just above its top-right corner, which is
+   where Discard sits: room under the bar keeps the toolbar off the buttons. */
+.st-key-im_edit_bar { margin-bottom: 1.6rem; }
 
 /* Operations with their own progress bar (Compute / Push Merge, monthly
    refresh): the page is locked like any big operation, and the progress bar
